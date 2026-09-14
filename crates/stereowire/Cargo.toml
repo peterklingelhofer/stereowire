@@ -1,0 +1,30 @@
+[package]
+name = "stereowire"
+version.workspace = true
+edition.workspace = true
+
+[[bin]]
+name = "stereowire"
+path = "src/main.rs"
+
+[dependencies]
+stereowire-proto = { path = "../stereowire-proto" }
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+cpal = "0.18"
+
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2 = "0.6"
+objc2-foundation = "0.3"
+objc2-app-kit = "0.3"
+objc2-screen-capture-kit = "0.3"
+objc2-core-media = "0.3"
+objc2-core-video = "0.3"
+objc2-core-foundation = "0.3"
+objc2-core-graphics = "0.3"
+objc2-video-toolbox = "0.3"
+objc2-av-foundation = { version = "0.3", features = ["objc2-core-media"] }
+objc2-quartz-core = "0.3"
+block2 = "0.6"
+dispatch2 = "0.3"
+objc2-core-audio-types = "0.3"

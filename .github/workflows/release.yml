@@ -1,0 +1,132 @@
+name: Release
+
+# Dormant on purpose. Releases are built, signed and notarized locally with
+# scripts/bundle.sh, which keeps the Developer ID key on one machine instead of
+# uploading it to GitHub. No tag push starts this, so it cannot fail for want of
+# secrets that were never added.
+#
+# To adopt it later, add the five secrets named below and either run it by hand
+# from the Actions tab against a tag, or restore this trigger:
+#
+#   push:
+#     tags: ['v*']
+#
+# Before doing that, note the repository is public. Fork pull requests are never
+# given secrets, so only write access could start a signing run, but the logs
+# are world readable and GitHub masks a secret by matching its literal value,
+# so anything *derived* from one is not masked. No step may enable shell
+# tracing, and nothing may print a decoded key.
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: macos-latest
+    steps:
+      # Pinned to a commit because this job holds the signing key, and a tag can
+      # be moved to point at different code.
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+
+      - name: Check the tag matches the version being built
+        run: |
+          set -euo pipefail
+          case "$GITHUB_REF" in
+            refs/tags/*) TAG="${GITHUB_REF_NAME#v}" ;;
+            *) echo "error: release must be run from a v* tag, got $GITHUB_REF" >&2
+               exit 1 ;;
+          esac
+          VERSION="$(grep -m1 '^version' Cargo.toml | sed -E 's/.*"(.*)".*/\1/')"
+          if [[ "$TAG" != "$VERSION" ]]; then
+            echo "error: tag v$TAG does not match Cargo.toml version $VERSION." >&2
+            echo "The bundle takes its CFBundleVersion from Cargo.toml, so these" >&2
+            echo "must agree or the app will report the wrong version." >&2
+            exit 1
+          fi
+          echo "releasing v$VERSION"
+
+      # Fail loudly and early on a missing secret. Without this the first
+      # symptom is `security import` complaining about an empty file, which
+      # sends you looking in the wrong place. Only emptiness is reported here,
+      # never any part of a value.
+      - name: Check the signing secrets are present
+        env:
+          CERT_P12: ${{ secrets.MACOS_CERT_P12 }}
+          CERT_PASSWORD: ${{ secrets.MACOS_CERT_PASSWORD }}
+          NOTARY_KEY: ${{ secrets.NOTARY_KEY_P8 }}
+          NOTARY_KEY_ID: ${{ secrets.NOTARY_KEY_ID }}
+          NOTARY_ISSUER: ${{ secrets.NOTARY_ISSUER }}
+        run: |
+          set -euo pipefail
+          missing=0
+          # var:secret, so the message names the secret you actually have to set
+          for pair in CERT_P12:MACOS_CERT_P12 \
+                      CERT_PASSWORD:MACOS_CERT_PASSWORD \
+                      NOTARY_KEY:NOTARY_KEY_P8 \
+                      NOTARY_KEY_ID:NOTARY_KEY_ID \
+                      NOTARY_ISSUER:NOTARY_ISSUER; do
+            var="${pair%%:*}"
+            if [[ -z "${!var:-}" ]]; then
+              echo "error: repository secret ${pair##*:} is empty or unset" >&2
+              missing=1
+            fi
+          done
+          if [[ $missing -eq 1 ]]; then
+            echo "See the release section of the README for how to produce each one." >&2
+            exit 1
+          fi
+
+      - name: Import signing certificate
+        env:
+          CERT_P12: ${{ secrets.MACOS_CERT_P12 }}
+          CERT_PASSWORD: ${{ secrets.MACOS_CERT_PASSWORD }}
+        run: |
+          set -euo pipefail
+          KEYCHAIN="$RUNNER_TEMP/build.keychain"
+          KEYCHAIN_PASSWORD="$(uuidgen)"
+          echo "KEYCHAIN=$KEYCHAIN" >> "$GITHUB_ENV"
+          echo "$CERT_P12" | base64 --decode > "$RUNNER_TEMP/cert.p12"
+          security create-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN"
+          security set-keychain-settings -lut 21600 "$KEYCHAIN"
+          security unlock-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN"
+          security import "$RUNNER_TEMP/cert.p12" -k "$KEYCHAIN" \
+            -P "$CERT_PASSWORD" -T /usr/bin/codesign
+          # Without this codesign blocks on a GUI prompt that no one can answer.
+          security set-key-partition-list -S apple-tool:,apple:,codesign: \
+            -s -k "$KEYCHAIN_PASSWORD" "$KEYCHAIN" >/dev/null
+          security list-keychain -d user -s "$KEYCHAIN" login.keychain
+          rm -f "$RUNNER_TEMP/cert.p12"
+
+      - name: Build, sign and notarize
+        env:
+          # An App Store Connect key is revocable on its own and is not tied to
+          # anyone's Apple ID password.
+          NOTARY_KEY: ${{ secrets.NOTARY_KEY_P8 }}
+          NOTARY_KEY_ID: ${{ secrets.NOTARY_KEY_ID }}
+          NOTARY_ISSUER: ${{ secrets.NOTARY_ISSUER }}
+        run: |
+          set -euo pipefail
+          echo "$NOTARY_KEY" | base64 --decode > "$RUNNER_TEMP/notary.p8"
+          export NOTARY_KEY_PATH="$RUNNER_TEMP/notary.p8"
+          ./scripts/bundle.sh --notarize
+          rm -f "$NOTARY_KEY_PATH"
+
+      - name: Verify the result is accepted by Gatekeeper
+        run: |
+          spctl --assess --type execute --verbose=2 dist/StereoWire.app
+          codesign --verify --strict --deep --verbose=2 dist/StereoWire.app
+
+      - name: Attach to the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          TAG="${GITHUB_REF_NAME}"
+          gh release create "$TAG" dist/StereoWire.zip \
+            --title "$TAG" --generate-notes || \
+          gh release upload "$TAG" dist/StereoWire.zip --clobber
+
+      - name: Remove the signing keychain
+        if: always()
+        run: security delete-keychain "$KEYCHAIN" || true

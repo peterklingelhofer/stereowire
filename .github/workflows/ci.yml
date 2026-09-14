@@ -1,0 +1,48 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  # The protocol crate is portable Rust and holds most of the tests, so it runs
+  # on Linux, which starts faster and costs less than a macOS runner.
+  protocol:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/cache@v6
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: linux-cargo-${{ hashFiles('Cargo.lock') }}
+      - run: cargo fmt --all -- --check
+      - run: cargo clippy -p stereowire-proto --all-targets -- -D warnings
+      - run: cargo test -p stereowire-proto
+
+  # The app itself needs Apple frameworks, so it can only build on macOS.
+  app:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/cache@v6
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: macos-cargo-${{ hashFiles('Cargo.lock') }}
+      - run: cargo clippy --all-targets -- -D warnings
+      - run: cargo test
+      - run: cargo build --release
+      # Exercises the real encoder, sockets, reassembly and decoder. Needs no
+      # display and no Screen Recording permission, so it runs unattended.
+      - name: Media path self-test
+        run: ./target/release/stereowire selftest --frames 60 --width 640 --height 360

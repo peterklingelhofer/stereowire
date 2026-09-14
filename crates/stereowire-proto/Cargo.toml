@@ -1,0 +1,6 @@
+[package]
+name = "stereowire-proto"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
