@@ -344,8 +344,8 @@ platform, with no encoder involved:
     stereowire selftest --replay pattern-h264.swd --loss 2 --reorder 5
 
 A 640x360 H.264 dump made this way scores PSNR mean 47.9 dB on the Mac's
-VideoToolbox decoder and 47.4 dB on Windows' Media Foundation decoder, audio
-bit-exact on both.
+VideoToolbox decoder and the same 47.9 dB on Windows' Media Foundation decoder
+(measured on GitHub's Windows runner), audio bit-exact on both.
 
 Producing a Windows build needs no Windows machine:
 
@@ -499,8 +499,9 @@ with FEC on, or ~3.1 Mbit/s with `--no-fec`.
   and `--max-width 1920` on the sender is the lever if the picture stutters.
 - HEVC on Windows needs the "HEVC Video Extensions" app from the Microsoft
   Store. Without it, the receiver asks for `--codec h264` instead.
-- Decoder latency on Windows has not been measured on real hardware, only
-  under CrossOver on a Mac.
+- Decoder latency on Windows has not been measured on real hardware.
+  Microsoft's decoder accepts low-latency mode there, and a real session will
+  show what that buys.
 - No encryption of its own: the tunnel provides it. See Security above.
 - Audio and video are timestamped on one capture clock and their offset is
   measured and reported, but nothing actively aligns them. Video is shown as
