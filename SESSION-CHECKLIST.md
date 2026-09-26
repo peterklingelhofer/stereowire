@@ -6,7 +6,7 @@ and the order to collect them in.
 
 ## Before starting
 
-On both Macs:
+On both machines:
 
     stereowire doctor
 
@@ -31,6 +31,14 @@ Sharer:
 
     stereowire send --to <peer>
 
+If the watcher is on Windows:
+
+- The sender adds `--codec h264`, since that decodes with no extra software.
+- The watcher runs `stereowire.exe receive`, or double-clicks `stereowire.exe`.
+- Allow the Windows Firewall prompt on first run.
+- Check the console afterwards for the interface rate note: if the output
+  device is not at the stream's rate, Windows resamples and says so.
+
 ## What to read, and what it means
 
 **Sender**, every five seconds:
@@ -49,7 +57,7 @@ Sharer:
 
 - Steady `keyframe requests` mean frames are being lost outright.
 - `audio: N recovered, M concealed` distinguishes repaired loss from audible
-  loss. Recovered costs nothing; concealed is a real gap.
+  loss. Recovered costs nothing. Concealed is a real gap.
 - `audio: correcting clock drift by N ppm` is expected on two machines and is
   the point of the feature. Anything under a few hundred ppm is normal.
 - `a/v offset` only appears with playback on, and is the first reading of
@@ -65,6 +73,7 @@ Sharer:
 | concealed audio blocks | receiver | the audio number that marks a real gap in playback |
 | clock drift ppm | receiver | confirms drift compensation is doing something on real clocks |
 | a/v offset | receiver | never yet measured between two machines |
+| frame pacing on Windows | receiver console, `video frames (N shown)` | whether software decoding keeps up with the sender's fps, the untested part of that path |
 
 ## If it goes wrong
 
@@ -73,7 +82,7 @@ Sharer:
 - **Picture freezes, audio fine:** the expected failure shape, since video is
   the fragile stream. Check keyframe requests and whether the bitrate settled
   low.
-- **Audio gaps:** raise `--buffer-ms` to 50 or more; jitter is exceeding the
+- **Audio gaps:** raise `--buffer-ms` to 50 or more: jitter is exceeding the
   buffer.
 - **Everything lags progressively:** the link cannot carry the bitrate. Lower
   `--mbps`.

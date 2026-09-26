@@ -10,23 +10,21 @@ use std::sync::mpsc::{sync_channel, RecvTimeoutError};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use anyhow::{Context, Result};
-use objc2::MainThreadMarker;
-use objc2_app_kit::{NSApplication, NSEventMask};
-use objc2_foundation::{NSDate, NSDefaultRunLoopMode};
+use anyhow::Result;
 use stereowire_proto::congestion::{Controller, Feedback};
 use stereowire_proto::packet::{
-    control, control_datagram, control_feedback_datagram, Header, Kind, MTU,
+    control, control_datagram, control_feedback_datagram, Codec, Header, Kind, MTU,
 };
 use stereowire_proto::rtt::{format_ms, Rtt};
 use stereowire_proto::video::{Depacketizer, Received};
 
 use crate::audio_out::AudioOut;
-use crate::mac::display::Display;
-use crate::mac::menu;
-use crate::mac::menu::Menu;
+#[cfg(target_os = "macos")]
+use crate::mac::viewer::Viewer;
 use crate::net::Link;
 use crate::wav::WavWriter;
+#[cfg(windows)]
+use crate::win::viewer::Viewer;
 
 /// Counters shared between the network thread and the reporting loop.
 #[derive(Default)]
@@ -46,6 +44,7 @@ struct VideoFrame {
     params: Option<Vec<Vec<u8>>>,
     data: Vec<u8>,
     pts_micros: u64,
+    codec: Codec,
 }
 
 pub fn run(
@@ -57,7 +56,6 @@ pub fn run(
     max_mbps: u32,
     min_mbps: u32,
 ) -> Result<()> {
-    let mtm = MainThreadMarker::new().context("the receiver must run on the main thread")?;
     // The receiver never captures, so Screen Recording is not required here.
     crate::preflight::report(&crate::preflight::check(None, false));
 
@@ -88,14 +86,9 @@ pub fn run(
         receive_loop(net_link, tx, net_jitter, net_stats, net_rtt, congestion)
     });
 
-    let app = NSApplication::sharedApplication(mtm);
-    // A plain binary is not launched the way a bundled app is, so AppKit needs
-    // to be told to finish starting up before it will deliver events or draw.
-    app.finishLaunching();
     // Open the window straight away rather than on the first frame, so there is
     // something on screen while waiting for the sender.
-    let mut display = Display::open(mtm, "stereowire", 1920, 1200)?;
-    let menu = Menu::install(mtm, show_latency);
+    let mut viewer = Viewer::open("stereowire", 1920, 1200, show_latency)?;
     let mut title_timer = Instant::now() - Duration::from_secs(1);
     let mut shown_title: Option<String> = None;
     let mut last_report = Instant::now();
@@ -106,14 +99,14 @@ pub fn run(
     let mut audio_started = false;
 
     loop {
-        pump_events(&app);
+        viewer.pump();
 
         match rx.recv_timeout(Duration::from_millis(2)) {
             Ok(frame) => {
                 if let Some(params) = &frame.params {
-                    display.set_params(params)?;
+                    viewer.set_params(frame.codec, params)?;
                 }
-                if display.present(&frame.data, frame.pts_micros)? {
+                if viewer.present(&frame.data, frame.pts_micros)? {
                     presented += 1;
                     // Both streams are stamped from the sender's clock, so the
                     // difference is the real audio/video offset rather than an
@@ -160,7 +153,7 @@ pub fn run(
             }
         }
 
-        if !display.is_open() || menu.should_quit() {
+        if !viewer.is_open() {
             break;
         }
 
@@ -168,10 +161,9 @@ pub fn run(
         // doing this per frame would be pure waste.
         if title_timer.elapsed() >= Duration::from_secs(1) {
             title_timer = Instant::now();
-            menu.sync_check_mark();
-            let detail = menu.show_latency().then(|| describe_link(&rtt, &jitter));
+            let detail = viewer.show_latency().then(|| describe_link(&rtt, &jitter));
             if shown_title.as_deref() != detail.as_deref() {
-                display.set_title(&menu::title("stereowire", detail.as_deref()));
+                viewer.set_title(&title("stereowire", detail.as_deref()));
                 shown_title = detail;
             }
         }
@@ -275,18 +267,11 @@ fn describe_link(
     )
 }
 
-/// Drains pending AppKit events so the window stays responsive.
-fn pump_events(app: &NSApplication) {
-    // `distantPast` makes this non-blocking: take what is queued and return.
-    while let Some(event) = unsafe {
-        app.nextEventMatchingMask_untilDate_inMode_dequeue(
-            NSEventMask::Any,
-            Some(&NSDate::distantPast()),
-            NSDefaultRunLoopMode,
-            true,
-        )
-    } {
-        app.sendEvent(&event);
+/// Builds the window title, with an optional detail suffix.
+fn title(base: &str, detail: Option<&str>) -> String {
+    match detail {
+        Some(detail) => format!("{base}  ·  {detail}"),
+        None => base.to_string(),
     }
 }
 
@@ -367,6 +352,7 @@ fn receive_loop(
                             params,
                             data,
                             pts_micros,
+                            codec,
                             ..
                         } => {
                             stats.video_frames.fetch_add(1, Ordering::Relaxed);
@@ -377,6 +363,7 @@ fn receive_loop(
                                 params,
                                 data,
                                 pts_micros,
+                                codec,
                             });
                         }
                         Received::NeedKeyframe => {

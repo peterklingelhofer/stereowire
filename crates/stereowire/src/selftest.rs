@@ -5,23 +5,38 @@
 //! UDP sockets, the real reassembler, and a real hardware decoder, and the
 //! result is compared against the reference image. Audio takes the same trip
 //! and is compared sample by sample.
+//!
+//! `--dump` captures the datagrams a live run produced, and `--replay` feeds
+//! them back through the same delivery-and-verify path without an encoder, so
+//! a platform that cannot encode yet can still be checked against a Mac's
+//! output.
 
 use std::net::UdpSocket;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use anyhow::{bail, Context, Result};
 use stereowire_proto::jitter::AudioJitter;
-use stereowire_proto::packet::{fragment, Header, SampleRate, AUDIO_CHANNELS, MTU};
+use stereowire_proto::packet::{fragment, Codec, Header, SampleRate, AUDIO_CHANNELS, MTU};
 use stereowire_proto::packetize::AudioPacketizer;
-use stereowire_proto::video::{Depacketizer, Frame, Framer, Received};
+use stereowire_proto::video::{Depacketizer, Received};
+#[cfg(target_os = "macos")]
+use stereowire_proto::video::{Frame, Framer};
 
+#[cfg(target_os = "macos")]
 use crate::mac::decoder::Decoder;
+#[cfg(target_os = "macos")]
 use crate::mac::encoder::Encoder;
-use crate::mac::pattern::{psnr, TestPattern};
+use crate::pattern::{psnr, TestPattern};
+#[cfg(windows)]
+use crate::win::decoder::Decoder;
 
 /// Below this, compression artifacts become visible. At the bitrates this
 /// tool uses, a clean path scores far higher.
 const MIN_PSNR_DB: f64 = 30.0;
+
+/// Identifies a stereowire self-test dump, and the version of its layout.
+const DUMP_MAGIC: &[u8; 8] = b"SWDUMP1\0";
 
 pub struct Options {
     pub frames: u32,
@@ -35,8 +50,16 @@ pub struct Options {
     /// jitter over a long path does.
     pub reorder: u32,
     /// Parity blocks per fragment group: one repairs a single loss, two repair
-    /// any pair.
+    /// any pair. Only `live_video` reads this: a replay carries its own
+    /// parity, already baked into the dump.
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
     pub parity: usize,
+    pub codec: Codec,
+    /// Write every video datagram the encoder produced to this file.
+    pub dump: Option<PathBuf>,
+    /// Replay video datagrams from a file written with `dump`, instead of
+    /// running an encoder.
+    pub replay: Option<PathBuf>,
 }
 
 /// A pair of connected loopback sockets, standing in for the real link.
@@ -147,16 +170,24 @@ impl Loopback {
 }
 
 pub fn run(options: Options) -> Result<()> {
+    if options.dump.is_some() && options.replay.is_some() {
+        bail!("--dump and --replay cannot both be given");
+    }
     println!("stereowire self-test");
-    println!(
-        "  {}x{}, {} frames at {} fps, {} Mbit/s, {}% simulated packet loss",
-        options.width,
-        options.height,
-        options.frames,
-        options.fps,
-        options.mbps,
-        options.loss_percent
-    );
+    if options.replay.is_none() {
+        println!(
+            "  {}x{}, {} frames at {} fps, {} Mbit/s, {} codec, {}% simulated packet loss",
+            options.width,
+            options.height,
+            options.frames,
+            options.fps,
+            options.mbps,
+            options.codec.name(),
+            options.loss_percent
+        );
+    } else {
+        println!("  {}% simulated packet loss", options.loss_percent);
+    }
 
     let video = video_round_trip(&options)?;
     let audio = audio_round_trip(&options)?;
@@ -174,12 +205,165 @@ struct Outcome {
     passed: bool,
 }
 
+/// Counts describing how the simulated link treated one run's datagrams.
+struct DeliveryStats {
+    discarded: u64,
+    resyncs: u64,
+    dropped: u64,
+    reordered: u64,
+    repaired: u64,
+}
+
+/// Accumulates what the depacketizer releases, shared by the encoder-driven
+/// and the file-driven sources: only how the datagrams are produced differs
+/// between them.
+struct Delivery {
+    video: Depacketizer,
+    params: Option<Vec<Vec<u8>>>,
+    codec: Option<Codec>,
+    /// Decodable frames, as (bytes, timestamp).
+    received: Vec<(Vec<u8>, u64)>,
+    /// Set when a gap forced a resync; the encoder-driven source honours this
+    /// by forcing a keyframe, the same recovery request the live sender gets.
+    wants_keyframe: bool,
+}
+
+impl Delivery {
+    fn new() -> Self {
+        Delivery {
+            video: Depacketizer::new(),
+            params: None,
+            codec: None,
+            received: Vec::new(),
+            wants_keyframe: false,
+        }
+    }
+
+    /// Drains whatever the loopback has delivered so far into the depacketizer.
+    fn drain(&mut self, link: &Loopback) {
+        link.drain(|header, body| self.video.push(header, body));
+        // Frames come out in order, and one arrival can release several when it
+        // fills a gap, so keep polling until nothing more is ready.
+        loop {
+            match self.video.poll() {
+                Received::Pending => break,
+                Received::NeedKeyframe => self.wants_keyframe = true,
+                Received::Frame {
+                    params,
+                    data,
+                    pts_micros,
+                    codec,
+                    ..
+                } => {
+                    if let Some(sets) = params {
+                        if self.params.is_none() {
+                            self.params = Some(sets);
+                            self.codec = Some(codec);
+                        }
+                    }
+                    self.received.push((data, pts_micros));
+                }
+            }
+        }
+    }
+
+    fn stats(&self, link: &Loopback) -> DeliveryStats {
+        DeliveryStats {
+            discarded: self.video.discarded,
+            resyncs: self.video.resyncs,
+            dropped: link.dropped,
+            reordered: link.reordered,
+            repaired: self.video.repaired(),
+        }
+    }
+}
+
+/// Captures the framer's raw output for later replay with `--replay`. The
+/// file write itself only happens in `finish`, so recording a datagram can
+/// never fail partway through a run. Only `live_video` builds one: a
+/// platform with no encoder has nothing of its own to dump.
+#[cfg(target_os = "macos")]
+struct DumpWriter {
+    path: PathBuf,
+    width: usize,
+    height: usize,
+    fps: i32,
+    frames: u32,
+    body: Vec<u8>,
+    count: u64,
+}
+
+#[cfg(target_os = "macos")]
+impl DumpWriter {
+    fn new(path: PathBuf, width: usize, height: usize, fps: i32, frames: u32) -> Self {
+        DumpWriter {
+            path,
+            width,
+            height,
+            fps,
+            frames,
+            body: Vec::new(),
+            count: 0,
+        }
+    }
+
+    /// Records one datagram exactly as the framer emitted it, before it goes
+    /// anywhere near the loopback's loss and reorder simulation.
+    fn record(&mut self, datagram: &[u8]) {
+        self.body
+            .extend_from_slice(&(datagram.len() as u16).to_le_bytes());
+        self.body.extend_from_slice(datagram);
+        self.count += 1;
+    }
+
+    fn finish(self) -> Result<()> {
+        let mut out = Vec::with_capacity(DUMP_MAGIC.len() + 16 + self.body.len());
+        out.extend_from_slice(DUMP_MAGIC);
+        out.extend_from_slice(&(self.width as u32).to_le_bytes());
+        out.extend_from_slice(&(self.height as u32).to_le_bytes());
+        out.extend_from_slice(&(self.fps as u32).to_le_bytes());
+        out.extend_from_slice(&self.frames.to_le_bytes());
+        out.extend_from_slice(&self.body);
+        std::fs::write(&self.path, &out)
+            .with_context(|| format!("could not write {}", self.path.display()))?;
+        println!(
+            "  video: wrote {} datagrams to {}",
+            self.count,
+            self.path.display()
+        );
+        Ok(())
+    }
+}
+
+#[cfg(target_os = "macos")]
 fn video_round_trip(options: &Options) -> Result<Outcome> {
+    if let Some(path) = &options.replay {
+        return replay_video(path, options);
+    }
+    live_video(options)
+}
+
+#[cfg(not(target_os = "macos"))]
+fn video_round_trip(options: &Options) -> Result<Outcome> {
+    if let Some(path) = &options.replay {
+        return replay_video(path, options);
+    }
+    bail!(
+        "this platform has no encoder; replay a dump made on a Mac with: \
+         stereowire selftest --codec h264 --dump pattern.swd"
+    )
+}
+
+/// Encodes the test pattern and delivers it, exactly as a live run does.
+/// Optionally captures every datagram to a dump file along the way.
+#[cfg(target_os = "macos")]
+fn live_video(options: &Options) -> Result<Outcome> {
     let pattern = TestPattern {
         width: options.width,
         height: options.height,
     };
     let encoder = Encoder::new(
+        options.codec,
         options.width as i32,
         options.height as i32,
         (options.mbps * 1_000_000) as i32,
@@ -188,59 +372,43 @@ fn video_round_trip(options: &Options) -> Result<Outcome> {
     let mut link = Loopback::new(options.loss_percent, options.reorder)?;
     let mut framer = Framer::new();
     framer.set_parity(options.parity);
-    let mut video = Depacketizer::new();
+    let mut delivery = Delivery::new();
+    let mut dump = options.dump.clone().map(|path| {
+        DumpWriter::new(
+            path,
+            options.width,
+            options.height,
+            options.fps,
+            options.frames,
+        )
+    });
 
-    let mut references = Vec::new();
-    let mut params: Option<Vec<Vec<u8>>> = None;
-    // Decodable frames, as (sequence, bytes, timestamp).
-    let mut received: Vec<(u64, Vec<u8>, u64)> = Vec::new();
     let mut sent_frames = 0u64;
     let mut keyframes = 0u64;
     let mut keyframe_requests = 0u64;
-    let mut wants_keyframe = false;
+    let mut dump_forced_keyframes = 0u64;
     // Rate-limits recovery requests the way the real receiver does.
     let mut frames_since_request = u32::MAX;
     let request_interval = (options.fps.max(1) as u32) / 4;
-
-    let drain = |link: &Loopback,
-                 video: &mut Depacketizer,
-                 params: &mut Option<Vec<Vec<u8>>>,
-                 received: &mut Vec<(u64, Vec<u8>, u64)>,
-                 wants_keyframe: &mut bool| {
-        link.drain(|header, body| video.push(header, body));
-        // Frames come out in order, and one arrival can release several when it
-        // fills a gap, so keep polling until nothing more is ready.
-        loop {
-            match video.poll() {
-                Received::Pending => break,
-                Received::NeedKeyframe => *wants_keyframe = true,
-                Received::Frame {
-                    seq,
-                    params: sets,
-                    data,
-                    pts_micros,
-                } => {
-                    if let Some(sets) = sets {
-                        if params.is_none() {
-                            *params = Some(sets);
-                        }
-                    }
-                    received.push((seq, data, pts_micros));
-                }
-            }
-        }
-    };
+    // A replay can never ask for a fresh keyframe, so a dump forces one more
+    // often than live recovery would, trading a little size now for
+    // resilience to whatever loss gets injected later at replay time.
+    let dump_interval = (options.fps.max(1) as u32 / 4).max(1);
 
     for index in 0..options.frames {
-        let (buffer, luma) = pattern.frame(index)?;
-        references.push(luma);
+        let (buffer, _) = pattern.frame(index)?;
 
-        // Honour a pending recovery request, exactly as the live sender does.
-        let force_key = index == 0 || (wants_keyframe && frames_since_request >= request_interval);
+        let wants_recovery = delivery.wants_keyframe && frames_since_request >= request_interval;
+        let dump_forced = dump.is_some() && index % dump_interval == 0;
+        let force_key = index == 0 || wants_recovery || dump_forced;
         if force_key && index > 0 {
-            keyframe_requests += 1;
-            frames_since_request = 0;
-            wants_keyframe = false;
+            if wants_recovery {
+                keyframe_requests += 1;
+                frames_since_request = 0;
+                delivery.wants_keyframe = false;
+            } else {
+                dump_forced_keyframes += 1;
+            }
         }
         frames_since_request = frames_since_request.saturating_add(1);
 
@@ -257,18 +425,18 @@ fn video_round_trip(options: &Options) -> Result<Outcome> {
                     params: &frame.params,
                     keyframe: frame.keyframe,
                     pts_micros: frame.pts_micros,
+                    codec: options.codec,
                 },
-                |dg| link.send(dg),
+                |dg| {
+                    if let Some(dump) = dump.as_mut() {
+                        dump.record(dg);
+                    }
+                    link.send(dg);
+                },
             );
             sent_frames += 1;
             // Drain as we go so the socket buffer never overflows.
-            drain(
-                &link,
-                &mut video,
-                &mut params,
-                &mut received,
-                &mut wants_keyframe,
-            );
+            delivery.drain(&link);
         }
     }
 
@@ -283,62 +451,192 @@ fn video_round_trip(options: &Options) -> Result<Outcome> {
                 params: &frame.params,
                 keyframe: frame.keyframe,
                 pts_micros: frame.pts_micros,
+                codec: options.codec,
             },
-            |dg| link.send(dg),
+            |dg| {
+                if let Some(dump) = dump.as_mut() {
+                    dump.record(dg);
+                }
+                link.send(dg);
+            },
         );
         sent_frames += 1;
     }
     std::thread::sleep(Duration::from_millis(100));
-    drain(
-        &link,
-        &mut video,
-        &mut params,
-        &mut received,
-        &mut wants_keyframe,
+    delivery.drain(&link);
+
+    println!(
+        "  video: encoded {sent_frames} frames ({keyframes} keyframes, {keyframe_requests} from \
+         recovery requests, {dump_forced_keyframes} forced for the dump)"
     );
 
-    let params = params.context("no HEVC parameter sets ever arrived; nothing could be decoded")?;
+    if let Some(dump) = dump {
+        dump.finish()?;
+    }
+
+    let stats = delivery.stats(&link);
+    let params = delivery
+        .params
+        .context("no parameter sets ever arrived; nothing could be decoded")?;
+    let codec = delivery.codec.expect("set alongside params");
+    verify_received(
+        &pattern,
+        options.fps,
+        options.loss_percent,
+        codec,
+        params,
+        &delivery.received,
+        stats,
+    )
+}
+
+/// Reads a dump written by `--dump` and delivers its datagrams through the
+/// same loopback and depacketizer a live run uses, without an encoder.
+fn replay_video(path: &Path, options: &Options) -> Result<Outcome> {
+    let bytes =
+        std::fs::read(path).with_context(|| format!("could not read {}", path.display()))?;
+    let header_len = DUMP_MAGIC.len() + 16;
+    if bytes.len() < header_len || &bytes[..DUMP_MAGIC.len()] != DUMP_MAGIC {
+        bail!("{} is not a stereowire self-test dump", path.display());
+    }
+    let field = |at: usize| -> u32 {
+        u32::from_le_bytes(bytes[at..at + 4].try_into().expect("checked length"))
+    };
+    let at = DUMP_MAGIC.len();
+    let width = field(at) as usize;
+    let height = field(at + 4) as usize;
+    let fps = field(at + 8) as i32;
+    let frame_count = field(at + 12);
+
     println!(
-        "  video: encoded {sent_frames} frames ({keyframes} keyframes, {keyframe_requests} from recovery requests)"
+        "  replaying {} ({width}x{height}, {frame_count} frames at {fps} fps); \
+         --width, --height, --frames, --fps, --codec and --mbps are ignored on replay",
+        path.display()
     );
+
+    let mut link = Loopback::new(options.loss_percent, options.reorder)?;
+    let mut delivery = Delivery::new();
+    let mut datagram_count = 0u64;
+    let mut cursor = header_len;
+    while cursor + 2 <= bytes.len() {
+        let len =
+            u16::from_le_bytes(bytes[cursor..cursor + 2].try_into().expect("checked")) as usize;
+        cursor += 2;
+        if cursor + len > bytes.len() {
+            break;
+        }
+        link.send(&bytes[cursor..cursor + len]);
+        cursor += len;
+        datagram_count += 1;
+        delivery.drain(&link);
+    }
+    link.flush();
+    std::thread::sleep(Duration::from_millis(100));
+    delivery.drain(&link);
+
+    println!("  video: replayed {datagram_count} datagrams from the dump");
+
+    let stats = delivery.stats(&link);
+    let params = delivery
+        .params
+        .context("no parameter sets in the dump; nothing could be decoded")?;
+    let codec = delivery.codec.expect("set alongside params");
+    let pattern = TestPattern { width, height };
+    verify_received(
+        &pattern,
+        fps,
+        options.loss_percent,
+        codec,
+        params,
+        &delivery.received,
+        stats,
+    )
+}
+
+/// Decodes one frame and scores whatever comes out against the reference
+/// pattern.
+///
+/// Frames are matched to their reference by timestamp rather than by
+/// position: a decoder on another platform may release frames a call later,
+/// so position-based matching would silently compare the wrong frames.
+fn score_frame(
+    decoder: &mut Decoder,
+    pattern: &TestPattern,
+    fps: i32,
+    data: &[u8],
+    pts_micros: u64,
+    scores: &mut Vec<f64>,
+) -> Result<bool> {
+    if decoder.decode(data, pts_micros).is_err() {
+        // A frame whose reference pictures were lost cannot decode, which is
+        // an expected outcome of packet loss.
+        return Ok(false);
+    }
+    score_drained(decoder, pattern, fps, scores)?;
+    Ok(true)
+}
+
+/// Scores whatever the decoder currently has queued, without decoding
+/// anything new. A decoder that pipelines internally (VideoToolbox does
+/// not; Media Foundation can) only releases its last few frames once told
+/// the stream has ended, which is what `finish` is for.
+fn score_drained(
+    decoder: &mut Decoder,
+    pattern: &TestPattern,
+    fps: i32,
+    scores: &mut Vec<f64>,
+) -> Result<()> {
+    for decoded in decoder.drain() {
+        if decoded.width != pattern.width || decoded.height != pattern.height {
+            bail!(
+                "decoded size {}x{} does not match the source {}x{}",
+                decoded.width,
+                decoded.height,
+                pattern.width,
+                pattern.height
+            );
+        }
+        let index = ((decoded.pts_micros as f64) * f64::from(fps) / 1e6).round() as u32;
+        if let Some(score) = psnr(&pattern.luma(index), &decoded.luma) {
+            scores.push(score);
+        }
+    }
+    Ok(())
+}
+
+/// Decodes every received frame, scores it, and prints the summary lines
+/// shared by the encoder-driven and file-driven sources.
+fn verify_received(
+    pattern: &TestPattern,
+    fps: i32,
+    loss_percent: u32,
+    codec: Codec,
+    params: Vec<Vec<u8>>,
+    received: &[(Vec<u8>, u64)],
+    stats: DeliveryStats,
+) -> Result<Outcome> {
     println!(
         "  video: {} frames decodable, {} discarded while out of sync, {} resyncs, {} dropped, {} reordered, {} fragments rebuilt by FEC",
         received.len(),
-        video.discarded,
-        video.resyncs,
-        link.dropped,
-        link.reordered,
-        video.repaired()
+        stats.discarded,
+        stats.resyncs,
+        stats.dropped,
+        stats.reordered,
+        stats.repaired
     );
 
-    let decoder = Decoder::new(&params)?;
+    let mut decoder = Decoder::new(codec, &params)?;
     let mut scores = Vec::new();
     let mut decode_errors = 0u64;
-    for (seq, data, pts) in &received {
-        if decoder.decode(data, *pts).is_err() {
-            // A frame whose reference pictures were lost cannot decode, which
-            // is an expected outcome of packet loss.
+    for (data, pts) in received {
+        if !score_frame(&mut decoder, pattern, fps, data, *pts, &mut scores)? {
             decode_errors += 1;
-            continue;
-        }
-        for decoded in decoder.drain() {
-            let Some(reference) = references.get(*seq as usize) else {
-                continue;
-            };
-            if decoded.width != options.width || decoded.height != options.height {
-                bail!(
-                    "decoded size {}x{} does not match the source {}x{}",
-                    decoded.width,
-                    decoded.height,
-                    options.width,
-                    options.height
-                );
-            }
-            if let Some(score) = psnr(reference, &decoded.luma) {
-                scores.push(score);
-            }
         }
     }
+    // Nothing more is coming: release whatever the decoder was still
+    // holding onto internally.
+    decoder.finish()?;
+    score_drained(&mut decoder, pattern, fps, &mut scores)?;
 
     if scores.is_empty() {
         bail!("no frames decoded; the video path is broken");
@@ -354,7 +652,7 @@ fn video_round_trip(options: &Options) -> Result<Outcome> {
     // On a clean link every frame must be good. With loss, frames referencing
     // lost data will be damaged; what matters is that the stream recovers and
     // the great majority land above the floor.
-    let passed = if options.loss_percent == 0 {
+    let passed = if loss_percent == 0 {
         if worst < MIN_PSNR_DB {
             println!("  video: FAIL, worst frame below the {MIN_PSNR_DB} dB floor");
         }

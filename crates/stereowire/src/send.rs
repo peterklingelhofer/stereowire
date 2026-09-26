@@ -7,7 +7,7 @@ use std::time::{Duration, Instant};
 use anyhow::{bail, Result};
 use objc2_core_video::CVImageBuffer;
 use stereowire_proto::packet::{
-    control, control_datagram, control_feedback, fragment, Header, Kind, SampleRate,
+    control, control_datagram, control_feedback, fragment, Codec, Header, Kind, SampleRate,
 };
 use stereowire_proto::packetize::AudioPacketizer;
 use stereowire_proto::video::{Frame, Framer};
@@ -17,6 +17,7 @@ use crate::mac::encoder::Encoder;
 use crate::net::Link;
 
 struct EncoderSettings {
+    codec: Codec,
     bitrate_bps: i32,
     fps: i32,
     fec: bool,
@@ -29,6 +30,7 @@ struct EncoderSettings {
 pub struct Options {
     pub peer: String,
     pub port: u16,
+    pub codec: Codec,
     pub bitrate_bps: i32,
     pub fps: i32,
     pub max_width: i32,
@@ -104,10 +106,17 @@ impl CaptureSink for Sender {
                 if width <= 0 || height <= 0 {
                     return;
                 }
-                match Encoder::new(width, height, self.settings.bitrate_bps, self.settings.fps) {
+                match Encoder::new(
+                    self.settings.codec,
+                    width,
+                    height,
+                    self.settings.bitrate_bps,
+                    self.settings.fps,
+                ) {
                     Ok(encoder) => {
                         println!(
-                            "encoding {width}x{height} at {} fps, {} Mbit/s",
+                            "encoding {width}x{height} {} at {} fps, {} Mbit/s",
+                            self.settings.codec.name(),
                             self.settings.fps,
                             self.settings.bitrate_bps / 1_000_000
                         );
@@ -142,6 +151,7 @@ impl CaptureSink for Sender {
                     params: &frame.params,
                     keyframe: frame.keyframe,
                     pts_micros: frame.pts_micros,
+                    codec: self.settings.codec,
                 },
                 |datagram| {
                     self.link.send(datagram);
@@ -249,6 +259,7 @@ pub fn run(options: Options) -> Result<()> {
         link: link.clone(),
         encoder: Mutex::new(None),
         settings: EncoderSettings {
+            codec: options.codec,
             bitrate_bps: options.bitrate_bps,
             fps: options.fps,
             fec: options.fec,

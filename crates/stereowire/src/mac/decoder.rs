@@ -1,4 +1,4 @@
-//! Headless HEVC decoding via VideoToolbox.
+//! Headless HEVC/H.264 decoding via VideoToolbox.
 //!
 //! The live receiver hands frames to `AVSampleBufferDisplayLayer`, which
 //! decodes and draws in one step but never gives the pixels back. This decoder
@@ -16,6 +16,7 @@ use objc2_video_toolbox::{
     VTDecodeFrameFlags, VTDecodeInfoFlags, VTDecompressionOutputCallbackRecord,
     VTDecompressionSession,
 };
+use stereowire_proto::packet::Codec;
 
 use super::sample;
 
@@ -25,7 +26,6 @@ pub struct DecodedFrame {
     pub luma: Vec<u8>,
     pub width: usize,
     pub height: usize,
-    #[allow(dead_code, reason = "carried for callers that reorder by timestamp")]
     pub pts_micros: u64,
 }
 
@@ -37,8 +37,8 @@ pub struct Decoder {
 }
 
 impl Decoder {
-    pub fn new(params: &[Vec<u8>]) -> Result<Self> {
-        let format = sample::format_from_params(params)?;
+    pub fn new(codec: Codec, params: &[Vec<u8>]) -> Result<Self> {
+        let format = sample::format_from_params(codec, params)?;
         let (tx, rx) = channel();
         let sink = Box::into_raw(Box::new(tx));
 
@@ -91,6 +91,13 @@ impl Decoder {
 
     pub fn drain(&self) -> impl Iterator<Item = DecodedFrame> + '_ {
         self.frames.try_iter()
+    }
+
+    /// No-op: `decode` is synchronous and already blocks until its own
+    /// frame has been released, so there is never anything left pipelined
+    /// to flush at end of stream, unlike a Media Foundation decoder.
+    pub fn finish(&self) -> Result<()> {
+        Ok(())
     }
 }
 

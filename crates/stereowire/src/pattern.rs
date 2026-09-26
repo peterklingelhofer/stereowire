@@ -4,12 +4,6 @@
 //! path can be tested without Screen Recording permission, and gives an exact
 //! reference image to compare the decoded output against.
 
-use std::ptr::NonNull;
-
-use anyhow::{bail, Result};
-use objc2_core_foundation::CFRetained;
-use objc2_core_video::{CVPixelBuffer, CVPixelBufferLockFlags};
-
 pub struct TestPattern {
     pub width: usize,
     pub height: usize,
@@ -38,7 +32,20 @@ impl TestPattern {
         }
         plane
     }
+}
 
+#[cfg(target_os = "macos")]
+use std::ptr::NonNull;
+
+#[cfg(target_os = "macos")]
+use anyhow::{bail, Result};
+#[cfg(target_os = "macos")]
+use objc2_core_foundation::CFRetained;
+#[cfg(target_os = "macos")]
+use objc2_core_video::{CVPixelBuffer, CVPixelBufferLockFlags};
+
+#[cfg(target_os = "macos")]
+impl TestPattern {
     /// Builds a pixel buffer holding frame `index`, ready for the encoder.
     pub fn frame(&self, index: u32) -> Result<(CFRetained<CVPixelBuffer>, Vec<u8>)> {
         let luma = self.luma(index);

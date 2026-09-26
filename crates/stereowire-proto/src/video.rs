@@ -6,18 +6,48 @@
 use std::collections::BTreeMap;
 
 use crate::fec;
-use crate::packet::{flags, read_params, write_params, Header, Kind, HEADER_LEN, MTU};
+use crate::packet::{flags, read_params, write_params, Codec, Header, Kind, HEADER_LEN, MTU};
 use crate::reassembly::Reassembler;
 
 /// One compressed frame, borrowed from whatever the encoder produced.
 pub struct Frame<'a> {
     pub data: &'a [u8],
-    /// VPS/SPS/PPS. Sent with every frame: they total about a hundred bytes,
-    /// and carrying them only on keyframes means one lost keyframe fragment
-    /// leaves the receiver unable to build a decoder until the next one.
+    /// VPS/SPS/PPS for HEVC, or SPS/PPS for H.264. Sent with every frame: they
+    /// total about a hundred bytes, and carrying them only on keyframes means
+    /// one lost keyframe fragment leaves the receiver unable to build a
+    /// decoder until the next one.
     pub params: &'a [Vec<u8>],
     pub keyframe: bool,
     pub pts_micros: u64,
+    pub codec: Codec,
+}
+
+/// Converts VideoToolbox's length-prefixed NAL units to Annex B.
+///
+/// VideoToolbox emits NAL units with a 4-byte big-endian length prefix. This
+/// returns the parameter sets, then every NAL unit of `data`, each preceded by
+/// the start code `00 00 00 01`, which is the form Windows Media Foundation
+/// and browsers' WebCodecs expect. Stops at the first malformed length (one
+/// that runs past the end) and returns what parsed so far.
+pub fn annex_b(params: &[Vec<u8>], data: &[u8]) -> Vec<u8> {
+    const START_CODE: [u8; 4] = [0, 0, 0, 1];
+    let mut out = Vec::with_capacity(data.len() + data.len() / 8 + 32);
+    for set in params {
+        out.extend_from_slice(&START_CODE);
+        out.extend_from_slice(set);
+    }
+    let mut rest = data;
+    while rest.len() >= 4 {
+        let (len_bytes, tail) = rest.split_at(4);
+        let len = u32::from_be_bytes(len_bytes.try_into().expect("checked 4 bytes")) as usize;
+        if len > tail.len() {
+            break;
+        }
+        out.extend_from_slice(&START_CODE);
+        out.extend_from_slice(&tail[..len]);
+        rest = &tail[len..];
+    }
+    out
 }
 
 /// Numbers frames, splits them into datagrams, and adds parity.
@@ -105,6 +135,7 @@ impl Framer {
                 pts_micros: frame.pts_micros,
                 flags: header_flags,
                 rate: None,
+                codec: Some(frame.codec),
             };
             let mut head = [0u8; HEADER_LEN];
             header.write(&mut head);
@@ -133,6 +164,7 @@ impl Framer {
                                 pts_micros: frame.pts_micros,
                                 flags: header_flags | flags::PARITY,
                                 rate: None,
+                                codec: Some(frame.codec),
                             };
                             let mut head = [0u8; HEADER_LEN];
                             header.write(&mut head);
@@ -166,6 +198,7 @@ pub enum Received {
         params: Option<Vec<Vec<u8>>>,
         data: Vec<u8>,
         pts_micros: u64,
+        codec: Codec,
     },
     /// A frame completed but cannot be decoded yet, because no keyframe has
     /// been seen since the stream started or since a frame went missing. The
@@ -188,6 +221,7 @@ struct Staged {
     data: Vec<u8>,
     pts_micros: u64,
     keyframe: bool,
+    codec: Codec,
 }
 
 /// Reassembles frames, puts them back in order, and tracks whether the stream
@@ -273,6 +307,9 @@ impl Depacketizer {
                 data,
                 pts_micros: frame.header.pts_micros,
                 keyframe: frame.header.has(flags::KEYFRAME),
+                // A sender that predates this field leaves it unset; HEVC was
+                // the only codec then, so that is the correct reading of it.
+                codec: frame.header.codec.unwrap_or(Codec::Hevc),
             },
         );
     }
@@ -331,6 +368,7 @@ impl Depacketizer {
             params: frame.params,
             data: frame.data,
             pts_micros: frame.pts_micros,
+            codec: frame.codec,
         }
     }
 
@@ -399,6 +437,7 @@ mod tests {
                 params: &sets,
                 keyframe: true,
                 pts_micros: 4242,
+                codec: Codec::Hevc,
             },
         ));
         assert_eq!(
@@ -407,7 +446,8 @@ mod tests {
                 seq: 0,
                 params: Some(sets),
                 data,
-                pts_micros: 4242
+                pts_micros: 4242,
+                codec: Codec::Hevc,
             },
             "a keyframe must survive fragmentation intact"
         );
@@ -426,6 +466,7 @@ mod tests {
                 params: &sets,
                 keyframe: false,
                 pts_micros: 0,
+                codec: Codec::Hevc,
             },
         ));
         assert_eq!(got, Received::NeedKeyframe);
@@ -439,6 +480,7 @@ mod tests {
                 params: &sets,
                 keyframe: true,
                 pts_micros: 1,
+                codec: Codec::Hevc,
             },
         ));
         assert!(matches!(got, Received::Frame { .. }));
@@ -453,6 +495,7 @@ mod tests {
             params: &sets,
             keyframe,
             pts_micros,
+            codec: Codec::Hevc,
         };
 
         assert!(matches!(
@@ -509,6 +552,7 @@ mod tests {
                     params: &sets,
                     keyframe,
                     pts_micros: i as u64,
+                    codec: Codec::Hevc,
                 },
                 |dg| dgs.push(dg.to_vec()),
             );
@@ -550,6 +594,7 @@ mod tests {
                 params: &sets,
                 keyframe: true,
                 pts_micros: 7,
+                codec: Codec::Hevc,
             },
             |dg| dgs.push(dg.to_vec()),
         );
@@ -575,6 +620,7 @@ mod tests {
             params: &sets,
             keyframe: k,
             pts_micros: 0,
+            codec: Codec::Hevc,
         };
 
         assert_eq!(d.take_loss(), None, "nothing seen yet");
@@ -635,6 +681,7 @@ mod tests {
                 params: &sets,
                 keyframe: true,
                 pts_micros: 11,
+                codec: Codec::Hevc,
             },
             |dg| datagrams.push(dg.to_vec()),
         );
@@ -663,7 +710,8 @@ mod tests {
                 seq: 0,
                 params: Some(sets),
                 data,
-                pts_micros: 11
+                pts_micros: 11,
+                codec: Codec::Hevc,
             },
             "the lost fragment must be rebuilt from parity, byte for byte"
         );
@@ -683,6 +731,7 @@ mod tests {
                 params: &sets,
                 keyframe: true,
                 pts_micros: 3,
+                codec: Codec::Hevc,
             },
             |dg| datagrams.push(dg.to_vec()),
         );
@@ -701,7 +750,8 @@ mod tests {
                 seq: 0,
                 params: Some(sets),
                 data,
-                pts_micros: 3
+                pts_micros: 3,
+                codec: Codec::Hevc,
             },
             "two losses in one group must be rebuilt exactly"
         );
@@ -719,6 +769,7 @@ mod tests {
                 params: &sets,
                 keyframe: true,
                 pts_micros: 0,
+                codec: Codec::Hevc,
             },
             |dg| datagrams.push(dg.to_vec()),
         );
@@ -751,6 +802,7 @@ mod tests {
                 params: &sets,
                 keyframe: false,
                 pts_micros: 0,
+                codec: Codec::Hevc,
             },
             |_| count += 1,
         );
@@ -768,6 +820,7 @@ mod tests {
                     params: &sets,
                     keyframe: false,
                     pts_micros: 0,
+                    codec: Codec::Hevc,
                 },
                 |_| {},
             );
@@ -787,6 +840,7 @@ mod tests {
                 params: &sets,
                 keyframe: true,
                 pts_micros: 0,
+                codec: Codec::Hevc,
             },
         );
         let got = last(round_trip(
@@ -797,6 +851,7 @@ mod tests {
                 params: &[],
                 keyframe: false,
                 pts_micros: 99,
+                codec: Codec::Hevc,
             },
         ));
         assert_eq!(
@@ -805,8 +860,90 @@ mod tests {
                 seq: 1,
                 params: None,
                 data: vec![2u8; 32],
-                pts_micros: 99
+                pts_micros: 99,
+                codec: Codec::Hevc,
             }
         );
+    }
+
+    #[test]
+    fn codec_survives_fragmentation_and_reassembly() {
+        let (mut f, mut d) = (Framer::new(), Depacketizer::new());
+        let sets = params();
+        let got = last(round_trip(
+            &mut d,
+            &mut f,
+            Frame {
+                data: &[6u8; MAX_PAYLOAD * 2 + 3],
+                params: &sets,
+                keyframe: true,
+                pts_micros: 0,
+                codec: Codec::H264,
+            },
+        ));
+        match got {
+            Received::Frame { codec, .. } => assert_eq!(codec, Codec::H264),
+            other => panic!("expected a decodable frame, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_sender_that_predates_the_codec_field_reads_as_hevc() {
+        let (mut f, mut d) = (Framer::new(), Depacketizer::new());
+        let sets = params();
+        let mut dgs = Vec::new();
+        f.send(
+            Frame {
+                data: &[1u8; 32],
+                params: &sets,
+                keyframe: true,
+                pts_micros: 0,
+                codec: Codec::H264,
+            },
+            |dg| dgs.push(dg.to_vec()),
+        );
+        // A v0.1.0 sender never wrote byte 23 on a video header, which parses
+        // as no codec at all; strip it back to that state.
+        for dg in &mut dgs {
+            dg[23] = 0;
+        }
+        let mut released = Vec::new();
+        for dg in &dgs {
+            let (h, b) = Header::parse(dg).expect("parses");
+            d.push(h, b);
+        }
+        released.extend(drain(&mut d));
+        match last(released) {
+            Received::Frame { codec, .. } => assert_eq!(codec, Codec::Hevc),
+            other => panic!("expected a decodable frame, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn annex_b_prefixes_params_and_each_nal_unit_with_a_start_code() {
+        let params = vec![vec![1u8, 2, 3], vec![4u8, 5]];
+        let nal_units = [vec![9u8, 9, 9], vec![7u8, 7]];
+        let mut data = Vec::new();
+        for nal in &nal_units {
+            data.extend_from_slice(&(nal.len() as u32).to_be_bytes());
+            data.extend_from_slice(nal);
+        }
+
+        let out = annex_b(&params, &data);
+
+        let mut expected = Vec::new();
+        for set in params.iter().chain(nal_units.iter()) {
+            expected.extend_from_slice(&[0, 0, 0, 1]);
+            expected.extend_from_slice(set);
+        }
+        assert_eq!(out, expected);
+    }
+
+    #[test]
+    fn annex_b_stops_at_a_length_that_runs_past_the_end() {
+        let mut data = 100u32.to_be_bytes().to_vec();
+        data.extend_from_slice(&[1, 2, 3]);
+        // The claimed length is longer than the three bytes that follow it.
+        assert!(annex_b(&[], &data).is_empty());
     }
 }

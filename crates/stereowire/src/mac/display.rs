@@ -14,14 +14,17 @@ use objc2_av_foundation::{AVQueuedSampleBufferRendering, AVSampleBufferDisplayLa
 use objc2_core_foundation::{CFRetained, CGPoint, CGRect, CGSize};
 use objc2_core_media::{kCMSampleAttachmentKey_DisplayImmediately, CMFormatDescription};
 use objc2_foundation::{NSMutableDictionary, NSString};
+use stereowire_proto::packet::Codec;
 
 use super::{cf, sample};
 
 pub struct Display {
     layer: Retained<AVSampleBufferDisplayLayer>,
     window: Retained<NSWindow>,
-    /// Cached decoder format, rebuilt whenever the parameter sets change.
+    /// Cached decoder format, rebuilt whenever the codec or parameter sets
+    /// change.
     format: Option<CFRetained<CMFormatDescription>>,
+    codec: Option<Codec>,
     params: Vec<Vec<u8>>,
 }
 
@@ -70,16 +73,19 @@ impl Display {
             layer,
             window,
             format: None,
+            codec: None,
             params: Vec::new(),
         })
     }
 
-    /// Installs new HEVC parameter sets, replacing the decoder format.
-    pub fn set_params(&mut self, params: &[Vec<u8>]) -> Result<()> {
-        if params.is_empty() || params == self.params {
+    /// Installs a new codec and parameter sets, replacing the decoder format
+    /// whenever either has changed.
+    pub fn set_params(&mut self, codec: Codec, params: &[Vec<u8>]) -> Result<()> {
+        if params.is_empty() || (Some(codec) == self.codec && params == self.params) {
             return Ok(());
         }
-        self.format = Some(sample::format_from_params(params)?);
+        self.format = Some(sample::format_from_params(codec, params)?);
+        self.codec = Some(codec);
         self.params = params.to_vec();
         // The decoder must start over on the next keyframe with the new format.
         unsafe { self.layer.sampleBufferRenderer().flush() };
@@ -120,8 +126,8 @@ impl Display {
 
     /// Updating the title is a main-thread AppKit call, so it is done on a
     /// timer rather than per frame.
-    pub fn set_title(&self, title: &NSString) {
-        self.window.setTitle(title);
+    pub fn set_title(&self, title: &str) {
+        self.window.setTitle(&NSString::from_str(title));
     }
 
     pub fn is_open(&self) -> bool {

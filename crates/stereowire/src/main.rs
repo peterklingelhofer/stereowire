@@ -1,33 +1,37 @@
-//! stereowire: a high-fidelity, low-latency screen-and-system-audio link between two
-//! Macs on the same Tailscale network.
+//! stereowire: a high-fidelity, low-latency screen-and-system-audio link from a Mac
+//! to a Mac or Windows PC on the same Tailscale network.
 //!
 //! Audio is sent uncompressed. For two people, a 48 kHz stereo float stream is
 //! about 3 Mbit/s, which is small enough that giving up any fidelity to a codec
 //! would be a poor trade.
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", windows))]
 mod audio_out;
 #[cfg(target_os = "macos")]
 mod mac;
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", windows))]
 mod net;
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", windows))]
+mod pattern;
+#[cfg(any(target_os = "macos", windows))]
 mod preflight;
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", windows))]
 mod receive;
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", windows))]
 mod selftest;
 #[cfg(target_os = "macos")]
 mod send;
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", windows))]
 mod wav;
+#[cfg(windows)]
+mod win;
 
-use clap::{Parser, Subcommand};
+use clap::{Parser, Subcommand, ValueEnum};
 
 #[derive(Parser)]
 #[command(
     name = "stereowire",
-    about = "High-fidelity screen and system-audio link between two Macs"
+    about = "High-fidelity screen and system-audio link from a Mac to a Mac or Windows PC"
 )]
 struct Cli {
     #[command(subcommand)]
@@ -48,6 +52,10 @@ enum Command {
         mbps: u32,
         #[arg(long, default_value_t = 60)]
         fps: i32,
+        /// Video codec. hevc is the default between Macs. Use h264 when the
+        /// watcher is on Windows, which decodes it without extra software.
+        #[arg(long, value_enum, default_value_t = CodecArg::Hevc)]
+        codec: CodecArg,
         /// Cap on capture width in pixels; the display is scaled down to fit.
         #[arg(long, default_value_t = 2560)]
         max_width: i32,
@@ -100,6 +108,17 @@ enum Command {
         /// Parity blocks per fragment group: 1 repairs a single loss, 2 any pair.
         #[arg(long, default_value_t = 1)]
         fec_parity: usize,
+        #[arg(long, value_enum, default_value_t = CodecArg::Hevc)]
+        codec: CodecArg,
+        /// Write every encoded video datagram to this file, exactly as sent,
+        /// so `--replay` can feed them back in later without an encoder.
+        #[arg(long)]
+        dump: Option<std::path::PathBuf>,
+        /// Replay video datagrams from a file written by `--dump`, instead of
+        /// running the encoder. --width, --height, --fps, --frames, --codec
+        /// and --mbps are ignored: those come from the dump itself.
+        #[arg(long)]
+        replay: Option<std::path::PathBuf>,
     },
     /// Watch and listen to a peer's shared screen.
     Receive {
@@ -127,7 +146,23 @@ enum Command {
     },
 }
 
-#[cfg(target_os = "macos")]
+#[derive(Clone, Copy, ValueEnum)]
+enum CodecArg {
+    Hevc,
+    #[value(name = "h264")]
+    H264,
+}
+
+impl From<CodecArg> for stereowire_proto::packet::Codec {
+    fn from(value: CodecArg) -> Self {
+        match value {
+            CodecArg::Hevc => stereowire_proto::packet::Codec::Hevc,
+            CodecArg::H264 => stereowire_proto::packet::Codec::H264,
+        }
+    }
+}
+
+#[cfg(any(target_os = "macos", windows))]
 fn main() -> anyhow::Result<()> {
     // Launched from Finder with no arguments, the useful default is to listen.
     // Finder also appends a process-serial argument that clap would reject.
@@ -150,11 +185,13 @@ fn main() -> anyhow::Result<()> {
         Cli::parse_from(args)
     };
     match cli.command {
+        #[cfg(target_os = "macos")]
         Command::Send {
             to,
             port,
             mbps,
             fps,
+            codec,
             max_width,
             no_fec,
             hide_cursor,
@@ -165,6 +202,7 @@ fn main() -> anyhow::Result<()> {
         } => send::run(send::Options {
             peer: to,
             port,
+            codec: codec.into(),
             bitrate_bps: (mbps * 1_000_000) as i32,
             fps,
             max_width,
@@ -175,6 +213,13 @@ fn main() -> anyhow::Result<()> {
             congestion_control: !no_congestion_control,
             allow_untunnelled,
         }),
+        // The field list is kept identical to the macOS arm above so clap's
+        // derived CLI surface (--to, --port, --codec, ...) is unchanged; only
+        // sending itself is not implemented yet on this platform.
+        #[cfg(windows)]
+        Command::Send { .. } => {
+            anyhow::bail!("sending is macOS only for now; this build can receive")
+        }
         Command::Receive {
             port,
             buffer_ms,
@@ -205,6 +250,9 @@ fn main() -> anyhow::Result<()> {
             loss,
             reorder,
             fec_parity,
+            codec,
+            dump,
+            replay,
         } => selftest::run(selftest::Options {
             frames,
             width,
@@ -214,6 +262,9 @@ fn main() -> anyhow::Result<()> {
             loss_percent: loss,
             reorder,
             parity: fec_parity,
+            codec: codec.into(),
+            dump,
+            replay,
         }),
     }
 }
@@ -233,8 +284,8 @@ fn resolve_sample_rate(
     }
 }
 
-#[cfg(not(target_os = "macos"))]
+#[cfg(not(any(target_os = "macos", windows)))]
 fn main() {
-    eprintln!("stereowire currently supports macOS only");
+    eprintln!("stereowire currently supports macOS and Windows only");
     std::process::exit(1);
 }

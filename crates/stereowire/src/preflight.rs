@@ -9,12 +9,16 @@ use std::path::PathBuf;
 use std::process::Command;
 
 /// Places the Tailscale CLI lands, depending on how it was installed.
+#[cfg(target_os = "macos")]
 const CLI_PATHS: [&str; 3] = [
     // The Mac App Store and standalone app bundle the CLI inside the app.
     "/Applications/Tailscale.app/Contents/MacOS/Tailscale",
     "/usr/local/bin/tailscale",
     "/opt/homebrew/bin/tailscale",
 ];
+
+#[cfg(windows)]
+const CLI_PATHS: [&str; 1] = [r"C:\Program Files\Tailscale\tailscale.exe"];
 
 pub struct Finding {
     pub ok: bool,
@@ -43,9 +47,20 @@ impl Finding {
 
 /// Locates the Tailscale CLI, if it is installed at all.
 pub fn tailscale_cli() -> Option<PathBuf> {
-    if let Ok(output) = Command::new("/usr/bin/which").arg("tailscale").output() {
+    #[cfg(windows)]
+    let found = Command::new("where").arg("tailscale").output();
+    #[cfg(not(windows))]
+    let found = Command::new("/usr/bin/which").arg("tailscale").output();
+
+    if let Ok(output) = found {
         if output.status.success() {
-            let path = String::from_utf8_lossy(&output.stdout).trim().to_string();
+            // `where` can print one match per line; `which` prints exactly one.
+            let path = String::from_utf8_lossy(&output.stdout)
+                .lines()
+                .next()
+                .unwrap_or("")
+                .trim()
+                .to_string();
             if !path.is_empty() {
                 return Some(PathBuf::from(path));
             }
@@ -64,16 +79,27 @@ fn run(cli: &PathBuf, args: &[&str]) -> Option<(bool, String)> {
     Some((output.status.success(), text))
 }
 
+#[cfg(target_os = "macos")]
 const INSTALL: &str = "install it with `brew install --cask tailscale`, or from \
 https://tailscale.com/download/macos, then run `tailscale up`";
 
+#[cfg(windows)]
+const INSTALL: &str = "install it from https://tailscale.com/download/windows, then sign in \
+from the tray icon";
+
 /// Runs every check that applies. `peer` is the address `send` will dial.
 pub fn check(peer: Option<&str>, needs_screen_recording: bool) -> Vec<Finding> {
+    // Screen Recording is a macOS concept; on other platforms the flag has
+    // nothing to check against.
+    #[cfg(not(target_os = "macos"))]
+    let _ = needs_screen_recording;
+
     let mut findings = Vec::new();
 
     let Some(cli) = tailscale_cli() else {
         findings.push(Finding::bad("Tailscale is not installed", INSTALL));
         // Every later check needs the CLI, so stop here.
+        #[cfg(target_os = "macos")]
         if needs_screen_recording {
             findings.push(screen_recording());
         }
@@ -87,7 +113,7 @@ pub fn check(peer: Option<&str>, needs_screen_recording: bool) -> Vec<Finding> {
             let hint = if text.contains("Logged out") || text.contains("logged out") {
                 "run `tailscale up` and sign in"
             } else if text.contains("stopped") {
-                "start Tailscale from the menu bar, or run `tailscale up`"
+                "start Tailscale from the menu bar or tray icon, or run `tailscale up`"
             } else {
                 "run `tailscale status` to see why"
             };
@@ -112,18 +138,20 @@ the router; run `tailscale netcheck` for details",
             Some((true, _)) => findings.push(Finding::ok(format!("{peer} is reachable, direct"))),
             Some((false, _)) | None => findings.push(Finding::bad(
                 format!("{peer} is not reachable"),
-                "check the name against `tailscale status`, and that the other Mac is \
+                "check the name against `tailscale status`, and that the other machine is \
 online and signed in to the same tailnet",
             )),
         }
     }
 
+    #[cfg(target_os = "macos")]
     if needs_screen_recording {
         findings.push(screen_recording());
     }
     findings
 }
 
+#[cfg(target_os = "macos")]
 fn screen_recording() -> Finding {
     // Preflight asks without prompting, so a missing permission can be
     // explained rather than surprising the user with a system dialog.
@@ -164,7 +192,7 @@ pub fn report(findings: &[Finding]) -> bool {
         .any(|f| !f.ok && f.what.contains("not installed"))
     {
         println!();
-        println!("Tailscale gives both Macs a stable private address and connects them");
+        println!("Tailscale gives both machines a stable private address and connects them");
         println!("directly, so stereowire needs no port forwarding and no public server.");
         println!("Both of you must be on the same tailnet: sign in to the same account,");
         println!("or invite the other from the admin console at https://login.tailscale.com");

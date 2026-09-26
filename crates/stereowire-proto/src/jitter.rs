@@ -375,6 +375,7 @@ mod tests {
             pts_micros: 0,
             flags: if fec { flags::HAS_FEC } else { 0 },
             rate: Some(SampleRate::Hz48000),
+            codec: None,
         }
     }
 

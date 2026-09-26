@@ -173,7 +173,7 @@ impl Reassembler {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::packet::Header;
+    use crate::packet::{Codec, Header};
     use crate::video::{Frame as VideoFrame, Framer};
 
     /// The largest payload a protected fragment carries, which is what the
@@ -192,6 +192,7 @@ mod tests {
                     params: &[],
                     keyframe: false,
                     pts_micros: 0,
+                    codec: Codec::Hevc,
                 },
                 |_| {},
             );
@@ -202,6 +203,7 @@ mod tests {
                 params: &[],
                 keyframe: true,
                 pts_micros: seq,
+                codec: Codec::Hevc,
             },
             |dg| out.push(dg.to_vec()),
         );

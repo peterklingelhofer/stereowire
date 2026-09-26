@@ -11,6 +11,7 @@ use objc2_core_foundation::CFRetained;
 use objc2_core_media::{
     CMBlockBuffer, CMFormatDescription, CMSampleBuffer, CMSampleTimingInfo, CMTime, CMTimeFlags,
 };
+use stereowire_proto::packet::Codec;
 
 /// Presentation timestamps travel in microseconds.
 pub const TIMESCALE: i32 = 1_000_000;
@@ -35,8 +36,11 @@ pub fn micros(value: u64) -> CMTime {
     }
 }
 
-/// Builds a decoder format description from HEVC parameter sets.
-pub fn format_from_params(params: &[Vec<u8>]) -> Result<CFRetained<CMFormatDescription>> {
+/// Builds a decoder format description from HEVC or H.264 parameter sets.
+pub fn format_from_params(
+    codec: Codec,
+    params: &[Vec<u8>],
+) -> Result<CFRetained<CMFormatDescription>> {
     if params.is_empty() || params.iter().any(Vec::is_empty) {
         bail!("parameter sets are missing or empty");
     }
@@ -48,18 +52,31 @@ pub fn format_from_params(params: &[Vec<u8>]) -> Result<CFRetained<CMFormatDescr
 
     let mut format: *const CMFormatDescription = std::ptr::null();
     let status = unsafe {
-        objc2_core_media::CMVideoFormatDescriptionCreateFromHEVCParameterSets(
-            None,
-            pointers.len(),
-            NonNull::from(&pointers[0]),
-            NonNull::from(&sizes[0]),
-            NAL_LENGTH_BYTES,
-            None,
-            NonNull::from(&mut format),
-        )
+        match codec {
+            Codec::Hevc => objc2_core_media::CMVideoFormatDescriptionCreateFromHEVCParameterSets(
+                None,
+                pointers.len(),
+                NonNull::from(&pointers[0]),
+                NonNull::from(&sizes[0]),
+                NAL_LENGTH_BYTES,
+                None,
+                NonNull::from(&mut format),
+            ),
+            Codec::H264 => objc2_core_media::CMVideoFormatDescriptionCreateFromH264ParameterSets(
+                None,
+                pointers.len(),
+                NonNull::from(&pointers[0]),
+                NonNull::from(&sizes[0]),
+                NAL_LENGTH_BYTES,
+                NonNull::from(&mut format),
+            ),
+        }
     };
     if status != 0 || format.is_null() {
-        bail!("could not build a format description from parameter sets (status {status})");
+        bail!(
+            "could not build a {} format description from parameter sets (status {status})",
+            codec.name()
+        );
     }
     Ok(unsafe {
         CFRetained::from_raw(NonNull::new(format as *mut CMFormatDescription).expect("checked"))

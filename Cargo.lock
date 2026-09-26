@@ -937,6 +937,7 @@ dependencies = [
  "objc2-screen-capture-kit",
  "objc2-video-toolbox",
  "stereowire-proto",
+ "windows",
 ]
 
 [[package]]

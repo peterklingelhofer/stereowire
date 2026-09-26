@@ -13,7 +13,7 @@ use objc2::{define_class, msg_send, sel, DefinedClass, MainThreadOnly};
 use objc2_app_kit::{
     NSApplication, NSControlStateValueOff, NSControlStateValueOn, NSMenu, NSMenuItem,
 };
-use objc2_foundation::{ns_string, MainThreadMarker, NSObject, NSObjectProtocol, NSString};
+use objc2_foundation::{ns_string, MainThreadMarker, NSObject, NSObjectProtocol};
 
 pub struct Ivars {
     show_latency: Arc<AtomicBool>,
@@ -134,13 +134,5 @@ impl Menu {
             NSControlStateValueOff
         };
         self.latency_item.setState(state);
-    }
-}
-
-/// Convenience for building the window title.
-pub fn title(base: &str, detail: Option<&str>) -> Retained<NSString> {
-    match detail {
-        Some(detail) => NSString::from_str(&format!("{base}  ·  {detail}")),
-        None => NSString::from_str(base),
     }
 }

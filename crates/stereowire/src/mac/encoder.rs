@@ -1,4 +1,4 @@
-//! Hardware HEVC encoding via VideoToolbox.
+//! Hardware HEVC/H.264 encoding via VideoToolbox.
 //!
 //! Tuned for latency rather than bits: B-frames are disabled so no frame ever
 //! waits on a later one, and the low-latency rate controller is requested so
@@ -13,18 +13,21 @@ use anyhow::{bail, Result};
 use objc2::runtime::AnyObject;
 use objc2_core_foundation::{CFRetained, CFString, CFType};
 use objc2_core_media::{
-    kCMSampleAttachmentKey_NotSync, kCMVideoCodecType_HEVC, CMSampleBuffer, CMTime, CMTimeFlags,
+    kCMSampleAttachmentKey_NotSync, kCMVideoCodecType_H264, kCMVideoCodecType_HEVC, CMSampleBuffer,
+    CMTime, CMTimeFlags,
 };
 use objc2_core_video::CVImageBuffer;
 use objc2_foundation::{NSDictionary, NSNumber, NSString};
 use objc2_video_toolbox::{
     kVTCompressionPropertyKey_AllowFrameReordering, kVTCompressionPropertyKey_AverageBitRate,
-    kVTCompressionPropertyKey_ExpectedFrameRate, kVTCompressionPropertyKey_MaxKeyFrameInterval,
-    kVTCompressionPropertyKey_ProfileLevel, kVTCompressionPropertyKey_RealTime,
-    kVTEncodeFrameOptionKey_ForceKeyFrame, kVTProfileLevel_HEVC_Main_AutoLevel,
-    kVTVideoEncoderSpecification_EnableLowLatencyRateControl, VTCompressionSession,
-    VTEncodeInfoFlags, VTSessionSetProperty,
+    kVTCompressionPropertyKey_ExpectedFrameRate, kVTCompressionPropertyKey_H264EntropyMode,
+    kVTCompressionPropertyKey_MaxKeyFrameInterval, kVTCompressionPropertyKey_ProfileLevel,
+    kVTCompressionPropertyKey_RealTime, kVTEncodeFrameOptionKey_ForceKeyFrame,
+    kVTH264EntropyMode_CABAC, kVTProfileLevel_H264_High_AutoLevel,
+    kVTProfileLevel_HEVC_Main_AutoLevel, kVTVideoEncoderSpecification_EnableLowLatencyRateControl,
+    VTCompressionSession, VTEncodeInfoFlags, VTSessionSetProperty,
 };
+use stereowire_proto::packet::Codec;
 
 use super::cf;
 
@@ -33,10 +36,10 @@ pub struct EncodedFrame {
     pub data: Vec<u8>,
     pub keyframe: bool,
     pub pts_micros: u64,
-    /// VPS/SPS/PPS, carried out-of-band on every frame. They total around a
-    /// hundred bytes, and sending them only on keyframes means a single lost
-    /// keyframe fragment leaves the receiver unable to build a decoder at all
-    /// until the next one, seconds later.
+    /// VPS/SPS/PPS, or SPS/PPS for H.264, carried out-of-band on every frame.
+    /// They total around a hundred bytes, and sending them only on keyframes
+    /// means a single lost keyframe fragment leaves the receiver unable to
+    /// build a decoder at all until the next one, seconds later.
     pub params: Vec<Vec<u8>>,
 }
 
@@ -44,41 +47,49 @@ pub struct EncodedFrame {
 /// a plain integer.
 const TIMESCALE: i32 = 1_000_000;
 
+/// Carried through the C callback's refcon: the codec is needed to read back
+/// the right kind of parameter sets, alongside the channel to the encoder.
+struct Sink {
+    codec: Codec,
+    tx: Sender<EncodedFrame>,
+}
+
 pub struct Encoder {
     session: CFRetained<VTCompressionSession>,
     frames: Receiver<EncodedFrame>,
-    /// Owns the sender the C callback writes through; must outlive the session.
-    sink: *mut Sender<EncodedFrame>,
+    /// Owns the sink the C callback writes through; must outlive the session.
+    sink: *mut Sink,
 }
 
 // The session and its callback are driven from the capture queue; the channel
-// ends are themselves Send.
+// end inside `Sink` is itself Send.
 unsafe impl Send for Encoder {}
 
 impl Encoder {
-    pub fn new(width: i32, height: i32, bitrate_bps: i32, fps: i32) -> Result<Self> {
+    pub fn new(codec: Codec, width: i32, height: i32, bitrate_bps: i32, fps: i32) -> Result<Self> {
         let (tx, rx) = channel();
-        let sink = Box::into_raw(Box::new(tx));
+        let sink = Box::into_raw(Box::new(Sink { codec, tx }));
 
         let spec = cf::dict(&[(
             unsafe { kVTVideoEncoderSpecification_EnableLowLatencyRateControl },
             cf::bool_value(true),
         )]);
 
-        // Low-latency rate control needs a hardware HEVC encoder. Apple Silicon
-        // and T2 Macs have one; some older Intel Macs do not, and a process
+        // Low-latency rate control needs a hardware encoder. Apple Silicon and
+        // T2 Macs have one; some older Intel Macs do not, and a process
         // translated by Rosetta cannot reach the one that is there. Falling back
         // to the default rate controller costs a little latency and is far
         // better than refusing to start on a Mac that could otherwise send.
         let mut session: *mut VTCompressionSession = std::ptr::null_mut();
-        let mut status = create_session(width, height, Some(&spec), sink, &mut session);
+        let mut status = create_session(codec, width, height, Some(&spec), sink, &mut session);
         if status != 0 || session.is_null() {
             eprintln!(
-                "note: no low-latency HEVC encoder on this Mac (status {status}), \
-                 falling back to the default rate controller"
+                "note: no low-latency {} encoder on this Mac (status {status}), \
+                 falling back to the default rate controller",
+                codec.name()
             );
             session = std::ptr::null_mut();
-            status = create_session(width, height, None, sink, &mut session);
+            status = create_session(codec, width, height, None, sink, &mut session);
         }
         if status != 0 || session.is_null() {
             drop(unsafe { Box::from_raw(sink) });
@@ -91,7 +102,7 @@ impl Encoder {
             frames: rx,
             sink,
         };
-        encoder.configure(bitrate_bps, fps)?;
+        encoder.configure(codec, bitrate_bps, fps)?;
         unsafe { encoder.session.prepare_to_encode_frames() };
         Ok(encoder)
     }
@@ -104,7 +115,7 @@ impl Encoder {
         Ok(())
     }
 
-    fn configure(&self, bitrate_bps: i32, fps: i32) -> Result<()> {
+    fn configure(&self, codec: Codec, bitrate_bps: i32, fps: i32) -> Result<()> {
         let real_time = cf::bool_value(true);
         let no_reorder = cf::bool_value(false);
         let bitrate = cf::i32_value(bitrate_bps);
@@ -131,10 +142,26 @@ impl Encoder {
                 kVTCompressionPropertyKey_MaxKeyFrameInterval,
                 cf::as_cf(&*key_interval),
             )?;
-            self.set(
-                kVTCompressionPropertyKey_ProfileLevel,
-                cf::as_cf(kVTProfileLevel_HEVC_Main_AutoLevel),
-            )?;
+            match codec {
+                Codec::Hevc => {
+                    self.set(
+                        kVTCompressionPropertyKey_ProfileLevel,
+                        cf::as_cf(kVTProfileLevel_HEVC_Main_AutoLevel),
+                    )?;
+                }
+                Codec::H264 => {
+                    self.set(
+                        kVTCompressionPropertyKey_ProfileLevel,
+                        cf::as_cf(kVTProfileLevel_H264_High_AutoLevel),
+                    )?;
+                    // Windows Media Foundation and browsers decode CABAC just
+                    // as well, and it compresses noticeably better than CAVLC.
+                    self.set(
+                        kVTCompressionPropertyKey_H264EntropyMode,
+                        cf::as_cf(kVTH264EntropyMode_CABAC),
+                    )?;
+                }
+            }
         }
         Ok(())
     }
@@ -224,18 +251,23 @@ impl Drop for Encoder {
 /// Split out so the caller can retry without low-latency rate control on a Mac
 /// that cannot provide it.
 fn create_session(
+    codec: Codec,
     width: i32,
     height: i32,
     spec: Option<&NSDictionary<NSString, AnyObject>>,
-    sink: *mut Sender<EncodedFrame>,
+    sink: *mut Sink,
     session: &mut *mut VTCompressionSession,
 ) -> i32 {
+    let codec_type = match codec {
+        Codec::Hevc => kCMVideoCodecType_HEVC,
+        Codec::H264 => kCMVideoCodecType_H264,
+    };
     unsafe {
         VTCompressionSession::create(
             None,
             width,
             height,
-            kCMVideoCodecType_HEVC,
+            codec_type,
             spec.map(cf::as_cf_dict),
             None,
             None,
@@ -257,16 +289,16 @@ unsafe extern "C-unwind" fn on_encoded(
         return;
     }
     let sample = unsafe { &*sample_buffer };
-    let sink = unsafe { &*(refcon as *const Sender<EncodedFrame>) };
+    let sink = unsafe { &*(refcon as *const Sink) };
 
-    let Some(frame) = (unsafe { extract(sample) }) else {
+    let Some(frame) = (unsafe { extract(sample, sink.codec) }) else {
         return;
     };
     // A closed receiver just means we are shutting down.
-    let _ = sink.send(frame);
+    let _ = sink.tx.send(frame);
 }
 
-unsafe fn extract(sample: &CMSampleBuffer) -> Option<EncodedFrame> {
+unsafe fn extract(sample: &CMSampleBuffer, codec: Codec) -> Option<EncodedFrame> {
     let keyframe = unsafe { is_keyframe(sample) };
 
     let block = unsafe { sample.data_buffer() }?;
@@ -291,7 +323,7 @@ unsafe fn extract(sample: &CMSampleBuffer) -> Option<EncodedFrame> {
     // Parameter sets live in the format description rather than the bitstream,
     // so they have to be carried alongside the frames themselves.
     let params = unsafe { sample.format_description() }
-        .map(|fd| unsafe { hevc_params(&fd) })
+        .map(|fd| unsafe { params(&fd, codec) })
         .unwrap_or_default();
 
     Some(EncodedFrame {
@@ -322,18 +354,30 @@ unsafe fn is_keyframe(sample: &CMSampleBuffer) -> bool {
     }
 }
 
-unsafe fn hevc_params(format: &objc2_core_media::CMFormatDescription) -> Vec<Vec<u8>> {
+/// Reads back VPS/SPS/PPS for HEVC, or SPS/PPS for H.264, from a format
+/// description VideoToolbox attached to an encoded sample.
+unsafe fn params(format: &objc2_core_media::CMFormatDescription, codec: Codec) -> Vec<Vec<u8>> {
     let mut count = 0usize;
     // The first call is only to learn how many parameter sets there are.
     let status = unsafe {
-        objc2_core_media::CMVideoFormatDescriptionGetHEVCParameterSetAtIndex(
-            format,
-            0,
-            std::ptr::null_mut(),
-            std::ptr::null_mut(),
-            &mut count,
-            std::ptr::null_mut(),
-        )
+        match codec {
+            Codec::Hevc => objc2_core_media::CMVideoFormatDescriptionGetHEVCParameterSetAtIndex(
+                format,
+                0,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                &mut count,
+                std::ptr::null_mut(),
+            ),
+            Codec::H264 => objc2_core_media::CMVideoFormatDescriptionGetH264ParameterSetAtIndex(
+                format,
+                0,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                &mut count,
+                std::ptr::null_mut(),
+            ),
+        }
     };
     if status != 0 {
         return Vec::new();
@@ -344,14 +388,28 @@ unsafe fn hevc_params(format: &objc2_core_media::CMFormatDescription) -> Vec<Vec
         let mut ptr: *const u8 = std::ptr::null();
         let mut size = 0usize;
         let status = unsafe {
-            objc2_core_media::CMVideoFormatDescriptionGetHEVCParameterSetAtIndex(
-                format,
-                index,
-                &mut ptr,
-                &mut size,
-                std::ptr::null_mut(),
-                std::ptr::null_mut(),
-            )
+            match codec {
+                Codec::Hevc => {
+                    objc2_core_media::CMVideoFormatDescriptionGetHEVCParameterSetAtIndex(
+                        format,
+                        index,
+                        &mut ptr,
+                        &mut size,
+                        std::ptr::null_mut(),
+                        std::ptr::null_mut(),
+                    )
+                }
+                Codec::H264 => {
+                    objc2_core_media::CMVideoFormatDescriptionGetH264ParameterSetAtIndex(
+                        format,
+                        index,
+                        &mut ptr,
+                        &mut size,
+                        std::ptr::null_mut(),
+                        std::ptr::null_mut(),
+                    )
+                }
+            }
         };
         if status != 0 || ptr.is_null() {
             return Vec::new();

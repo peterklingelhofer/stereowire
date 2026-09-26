@@ -75,6 +75,34 @@ pub enum Kind {
     Control = 2,
 }
 
+/// Video codecs the wire format can carry.
+///
+/// The codec travels in every video packet rather than being agreed up front,
+/// the same way [`SampleRate`] travels with audio.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub enum Codec {
+    Hevc = 1,
+    H264 = 2,
+}
+
+impl Codec {
+    pub fn from_code(code: u8) -> Option<Self> {
+        match code {
+            1 => Some(Codec::Hevc),
+            2 => Some(Codec::H264),
+            _ => None,
+        }
+    }
+
+    pub fn name(self) -> &'static str {
+        match self {
+            Codec::Hevc => "HEVC",
+            Codec::H264 => "H.264",
+        }
+    }
+}
+
 impl Kind {
     fn from_u8(v: u8) -> Option<Self> {
         match v {
@@ -89,7 +117,8 @@ impl Kind {
 pub mod flags {
     /// Video: this frame is an IDR.
     pub const KEYFRAME: u8 = 1 << 0;
-    /// Video: payload begins with an HEVC parameter-set blob (see `params`).
+    /// Video: payload begins with a parameter-set blob, VPS/SPS/PPS for HEVC
+    /// or SPS/PPS for H.264 (see `params`).
     pub const HAS_PARAMS: u8 = 1 << 1;
     /// Audio: payload carries the previous packet's block after the current one.
     pub const HAS_FEC: u8 = 1 << 2;
@@ -125,6 +154,7 @@ pub fn control_datagram(flag: u8, stamp_micros: u64) -> [u8; HEADER_LEN] {
         pts_micros: stamp_micros,
         flags: flag,
         rate: None,
+        codec: None,
     };
     let mut out = [0u8; HEADER_LEN];
     header.write(&mut out);
@@ -144,8 +174,10 @@ pub struct Header {
     /// Capture time on the sender's monotonic clock.
     pub pts_micros: u64,
     pub flags: u8,
-    /// Audio packets carry their sample rate here. Ignored for other kinds.
+    /// Audio: sample rate. Ignored for other kinds.
     pub rate: Option<SampleRate>,
+    /// Video: the codec `data` is encoded with. Ignored for other kinds.
+    pub codec: Option<Codec>,
 }
 
 impl Header {
@@ -157,21 +189,36 @@ impl Header {
         out[6..14].copy_from_slice(&self.seq.to_le_bytes());
         out[14..22].copy_from_slice(&self.pts_micros.to_le_bytes());
         out[22] = self.flags;
-        out[23] = self.rate.map_or(0, |rate| rate as u8);
+        // Byte 23's meaning depends on the kind: a sample rate for audio, a
+        // codec for video, and nothing at all for control.
+        out[23] = match self.kind {
+            Kind::Audio => self.rate.map_or(0, |rate| rate as u8),
+            Kind::Video => self.codec.map_or(0, |codec| codec as u8),
+            Kind::Control => 0,
+        };
     }
 
     pub fn parse(buf: &[u8]) -> Option<(Header, &[u8])> {
         if buf.len() < HEADER_LEN || buf[0] != VERSION {
             return None;
         }
+        let kind = Kind::from_u8(buf[1])?;
         let header = Header {
-            kind: Kind::from_u8(buf[1])?,
+            kind,
             fragment_index: u16::from_le_bytes([buf[2], buf[3]]),
             fragment_count: u16::from_le_bytes([buf[4], buf[5]]),
             seq: u64::from_le_bytes(buf[6..14].try_into().ok()?),
             pts_micros: u64::from_le_bytes(buf[14..22].try_into().ok()?),
             flags: buf[22],
-            rate: SampleRate::from_code(buf[23]),
+            rate: (kind == Kind::Audio)
+                .then(|| SampleRate::from_code(buf[23]))
+                .flatten(),
+            // A v0.1.0 sender never wrote this byte and left it zero, which is
+            // not a valid codec code, so it parses as None here; the caller
+            // decides how to treat that absence.
+            codec: (kind == Kind::Video)
+                .then(|| Codec::from_code(buf[23]))
+                .flatten(),
         };
         if header.fragment_count == 0 || header.fragment_index >= header.fragment_count {
             return None;
@@ -226,7 +273,8 @@ pub fn control_feedback(body: &[u8]) -> Option<(u32, u32)> {
     Some((bitrate, parity))
 }
 
-/// Encodes HEVC parameter sets as `count:u8` then `len:u32 || bytes` per set.
+/// Encodes parameter sets (VPS/SPS/PPS for HEVC, or SPS/PPS for H.264) as
+/// `count:u8` then `len:u32 || bytes` per set.
 pub fn write_params(sets: &[Vec<u8>], out: &mut Vec<u8>) {
     out.push(sets.len() as u8);
     for set in sets {
@@ -267,6 +315,7 @@ mod tests {
             pts_micros: 42,
             flags: 0,
             rate: None,
+            codec: None,
         }
     }
 
@@ -280,6 +329,7 @@ mod tests {
             pts_micros: 1234567,
             flags: flags::KEYFRAME | flags::HAS_PARAMS,
             rate: None,
+            codec: None,
         };
         let mut buf = [0u8; HEADER_LEN];
         h.write(&mut buf);
@@ -379,6 +429,39 @@ mod tests {
             "a rate we do not know must not be guessed"
         );
         assert!(SampleRate::from_hz(37_000).is_none());
+    }
+
+    #[test]
+    fn video_header_round_trips_the_codec() {
+        for codec in [Codec::Hevc, Codec::H264] {
+            let mut h = header(Kind::Video, 5);
+            h.codec = Some(codec);
+            let mut buf = [0u8; HEADER_LEN];
+            h.write(&mut buf);
+            let (parsed, _) = Header::parse(&buf).expect("parses");
+            assert_eq!(parsed.codec, Some(codec));
+        }
+    }
+
+    #[test]
+    fn audio_header_round_trips_the_rate_and_carries_no_codec() {
+        let mut h = header(Kind::Audio, 3);
+        h.rate = Some(SampleRate::Hz48000);
+        let mut buf = [0u8; HEADER_LEN];
+        h.write(&mut buf);
+        let (parsed, _) = Header::parse(&buf).expect("parses");
+        assert_eq!(parsed.rate, Some(SampleRate::Hz48000));
+        assert_eq!(parsed.codec, None, "byte 23 means something else for audio");
+    }
+
+    #[test]
+    fn a_video_header_with_byte_23_zero_reads_as_no_codec() {
+        // A v0.1.0 sender never wrote this byte, leaving it zero.
+        let mut buf = [0u8; HEADER_LEN];
+        header(Kind::Video, 1).write(&mut buf);
+        buf[23] = 0;
+        let (parsed, _) = Header::parse(&buf).expect("parses");
+        assert_eq!(parsed.codec, None);
     }
 
     #[test]

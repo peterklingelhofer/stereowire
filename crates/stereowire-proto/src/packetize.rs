@@ -82,6 +82,7 @@ impl AudioPacketizer {
                 pts_micros,
                 flags: if has_fec { flags::HAS_FEC } else { 0 },
                 rate: Some(self.rate),
+                codec: None,
             };
             emit(header, &payload);
 

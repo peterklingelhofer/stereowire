@@ -27,7 +27,8 @@ jobs:
       - run: cargo clippy -p stereowire-proto --all-targets -- -D warnings
       - run: cargo test -p stereowire-proto
 
-  # The app itself needs Apple frameworks, so it can only build on macOS.
+  # The sender needs Apple frameworks, so it only builds on macOS. The
+  # receiver also builds on Windows, checked below in the windows job
   app:
     runs-on: macos-latest
     steps:
@@ -46,3 +47,56 @@ jobs:
       # display and no Screen Recording permission, so it runs unattended.
       - name: Media path self-test
         run: ./target/release/stereowire selftest --frames 60 --width 640 --height 360
+      # Windows has no encoder, so its self-test replays datagrams recorded
+      # here instead. H.264 is the codec it decodes without extra software,
+      # which is what the windows job below needs to check
+      - name: Dump an H.264 pattern for the Windows self-test to replay
+        run: ./target/release/stereowire selftest --codec h264 --frames 60 --width 640 --height 360 --dump pattern-h264.swd
+      - uses: actions/upload-artifact@v4
+        with:
+          name: selftest-dump
+          path: pattern-h264.swd
+
+  # Builds and tests the receiver on Windows. Needs the app job's H.264 dump,
+  # since this platform has no encoder of its own to make one with
+  windows:
+    needs: app
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/cache@v6
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: windows-cargo-${{ hashFiles('Cargo.lock') }}
+      # The runner image's manifest does not list Media Foundation, and a
+      # missing mfplat.dll stops any binary that imports it from loading at
+      # all, before main ever runs. This has to happen before anything below
+      # links against it
+      - name: Install Media Foundation
+        shell: powershell
+        run: |
+          Import-Module ServerManager
+          $feature = Get-WindowsFeature Server-Media-Foundation
+          if ($feature -and -not $feature.Installed) { Install-WindowsFeature Server-Media-Foundation }
+      - run: cargo clippy --all-targets -- -D warnings
+      - run: cargo test
+      - run: cargo build --release
+      - uses: actions/download-artifact@v4
+        with:
+          name: selftest-dump
+      - name: Replay the Mac's H.264 dump through the Windows decoder
+        run: .\target\release\stereowire.exe selftest --replay pattern-h264.swd
+      - name: Replay again with loss and reordering
+        run: .\target\release\stereowire.exe selftest --replay pattern-h264.swd --loss 2 --reorder 5
+      # A fresh runner has nothing installed, so this is the path a new
+      # Windows user actually hits: no crash, and doctor still exits 0 with
+      # the Tailscale hint printed
+      - name: Check doctor on a machine with nothing set up
+        run: .\target\release\stereowire.exe doctor
+      - uses: actions/upload-artifact@v4
+        with:
+          name: stereowire-windows-x64
+          path: target\release\stereowire.exe

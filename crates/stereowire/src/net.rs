@@ -18,6 +18,10 @@ impl Link {
     ///
     /// Returns the link and the address it resolved to, so the caller can check
     /// whether that address is inside the tunnel this tool depends on.
+    ///
+    /// Only `send.rs` calls this directly; a build with no sender yet still
+    /// exercises it from this file's own tests.
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
     pub fn connect(peer: &str, port: u16) -> Result<(Self, SocketAddr)> {
         let addr = (peer, port)
             .to_socket_addrs()
@@ -41,6 +45,8 @@ impl Link {
         Ok(Link { socket })
     }
 
+    /// Sends on the connected socket `connect` set up; only a sender uses this.
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
     pub fn send(&self, datagram: &[u8]) {
         // A dropped datagram is the transport working as designed; the jitter
         // buffer and keyframe requests handle the consequences.

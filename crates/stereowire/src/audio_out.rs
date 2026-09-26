@@ -24,6 +24,27 @@ impl AudioOut {
             .default_output_device()
             .context("no audio output device")?;
 
+        if let Some(device_rate) = default_device_rate() {
+            if device_rate != rate {
+                #[cfg(target_os = "macos")]
+                println!(
+                    "audio: the output device was at {} Hz, playback runs it at {} Hz and does \
+                     not set it back when it stops (Audio MIDI Setup restores it)",
+                    device_rate.hz(),
+                    rate.hz()
+                );
+                #[cfg(windows)]
+                println!(
+                    "audio: the output device runs at {} Hz, so Windows resamples this {} Hz \
+                     stream. For a lossless path set the device to {} Hz in Settings > System > \
+                     Sound, under the device's Format",
+                    device_rate.hz(),
+                    rate.hz(),
+                    rate.hz()
+                );
+            }
+        }
+
         let config = cpal::StreamConfig {
             channels: AUDIO_CHANNELS as u16,
             sample_rate: rate.hz(),
