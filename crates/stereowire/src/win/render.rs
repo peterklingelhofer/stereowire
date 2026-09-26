@@ -22,10 +22,11 @@ use super::decoder::DecodedFrame;
 
 /// Fullscreen-triangle vertex shader plus a BT.709 pixel shader. The decoder
 /// already crops to the display area, so the textures are always frame
-/// sized and sampling needs no UV scaling constant. It also already expands
-/// luma to full range (see `win::decoder::expand_limited_range`, needed
-/// regardless so the self-test's byte comparison means the same thing on
-/// both platforms), so only chroma still needs the limited-range Cb/Cr to
+/// sized and sampling needs no UV scaling constant. It also already
+/// normalizes luma to full range no matter what the decoder itself
+/// delivered (see the module doc comment on `win::decoder`), which the
+/// self-test's byte comparison needs to mean the same thing on both
+/// platforms, so only chroma still needs the limited-range Cb/Cr to
 /// signed-deviation step here.
 const SHADER_SOURCE: &str = r#"
 struct VSOut {
