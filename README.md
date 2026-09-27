@@ -491,7 +491,7 @@ a release:
 
 ```
 ./scripts/bundle.sh --notarize          # build, sign, notarize, staple, re-zip
-gh release create v0.1.0 dist/StereoWire.zip --title v0.1.0 --generate-notes
+gh release create v0.2.0 dist/StereoWire.zip stereowire-windows-x64.zip --title v0.2.0
 ```
 
 Keep the tag and the workspace version in `Cargo.toml` in step, because the
