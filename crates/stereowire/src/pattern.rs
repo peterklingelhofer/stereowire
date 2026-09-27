@@ -108,6 +108,42 @@ impl TestPattern {
     }
 }
 
+/// One frame in NV12: a luma plane followed by an interleaved UV plane,
+/// tightly packed.
+// The Windows sender's capture and encoder use this
+#[cfg_attr(target_os = "macos", allow(dead_code))]
+pub struct Nv12Frame {
+    pub width: usize,
+    pub height: usize,
+    /// Luma plane then interleaved UV plane, tightly packed.
+    pub data: Vec<u8>,
+}
+
+#[cfg_attr(target_os = "macos", allow(dead_code))]
+impl TestPattern {
+    /// The frame for `index` in NV12: `luma(index)` mapped to limited range
+    /// (16-235), followed by a neutral chroma plane.
+    ///
+    /// The Windows encoder's input type declares limited range, and the
+    /// Windows decoder expands limited range back to full, so the self-test
+    /// still compares full range with full range.
+    pub fn nv12(&self, index: u32) -> Nv12Frame {
+        let mut data: Vec<u8> = self.luma(index).into_iter().map(limited_range).collect();
+        data.resize(self.width * self.height * 3 / 2, 128);
+        Nv12Frame {
+            width: self.width,
+            height: self.height,
+            data,
+        }
+    }
+}
+
+/// Maps a full-range (0-255) luma value to limited range (16-235), rounded.
+#[cfg_attr(target_os = "macos", allow(dead_code))]
+fn limited_range(luma: u8) -> u8 {
+    ((16 * 255 + u32::from(luma) * 219 + 127) / 255) as u8
+}
+
 /// Peak signal-to-noise ratio in dB between a reference and a decoded plane.
 ///
 /// Returns `None` if the planes are not comparable. `f64::INFINITY` means the
@@ -129,4 +165,31 @@ pub fn psnr(reference: &[u8], decoded: &[u8]) -> Option<f64> {
         return Some(f64::INFINITY);
     }
     Some(10.0 * (255.0f64 * 255.0 / mse).log10())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn nv12_is_limited_range_luma_plus_neutral_chroma() {
+        let pattern = TestPattern {
+            width: 16,
+            height: 8,
+        };
+        let luma = pattern.luma(3);
+        let frame = pattern.nv12(3);
+        assert_eq!(frame.data.len(), pattern.width * pattern.height * 3 / 2);
+        let expected: Vec<u8> = luma.iter().map(|&value| limited_range(value)).collect();
+        assert_eq!(&frame.data[..luma.len()], expected.as_slice());
+        assert!(frame.data[luma.len()..].iter().all(|&b| b == 128));
+    }
+
+    #[test]
+    fn limited_range_maps_the_endpoints_and_rounds() {
+        assert_eq!(limited_range(0), 16);
+        assert_eq!(limited_range(255), 235);
+        // 16 + 128 * 219 / 255 is 125.93
+        assert_eq!(limited_range(128), 126);
+    }
 }

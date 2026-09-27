@@ -5,16 +5,21 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use anyhow::{bail, Result};
-use objc2_core_video::CVImageBuffer;
 use stereowire_proto::packet::{
     control, control_datagram, control_feedback, fragment, Codec, Header, Kind, SampleRate,
 };
 use stereowire_proto::packetize::AudioPacketizer;
 use stereowire_proto::video::{Frame, Framer};
 
-use crate::mac::capture::{Capture, CaptureOptions, CaptureSink};
+#[cfg(target_os = "macos")]
+use crate::mac::capture::{frame_size, Capture, CaptureOptions, CaptureSink, CapturedFrame};
+#[cfg(target_os = "macos")]
 use crate::mac::encoder::Encoder;
 use crate::net::Link;
+#[cfg(windows)]
+use crate::win::capture::{frame_size, Capture, CaptureOptions, CaptureSink, CapturedFrame};
+#[cfg(windows)]
+use crate::win::encoder::Encoder;
 
 struct EncoderSettings {
     codec: Codec,
@@ -42,12 +47,15 @@ pub struct Options {
     pub congestion_control: bool,
     /// Send to an address outside the tunnel anyway.
     pub allow_untunnelled: bool,
+    /// Audio device to capture instead of the default output's loopback.
+    /// Only Windows can choose one. The Mac captures the system mix.
+    pub audio_device: Option<String>,
 }
 
 struct Sender {
     link: Arc<Link>,
     /// Built from the first frame, so the encoder matches exactly what
-    /// ScreenCaptureKit delivers rather than what we predicted it would.
+    /// the capture delivers rather than what we predicted it would.
     encoder: Mutex<Option<Encoder>>,
     settings: EncoderSettings,
     /// Built once the capture reveals the rate it is actually running at.
@@ -66,6 +74,9 @@ struct Sender {
     current_bps: std::sync::atomic::AtomicI32,
     /// Loudest sample seen since the last report, scaled to 0..10000.
     audio_peak: AtomicU64,
+    /// Set when the encoder cannot start. No later frame would fare any
+    /// better, so the main loop ends the run with this message.
+    fatal: Mutex<Option<String>>,
 }
 
 impl Sender {
@@ -94,15 +105,25 @@ impl Sender {
 }
 
 impl CaptureSink for Sender {
-    fn on_video(&self, image: &CVImageBuffer, pts_micros: u64) {
+    fn on_video(&self, frame: &CapturedFrame, pts_micros: u64) {
         let mut slot = self.encoder.lock().expect("encoder mutex not poisoned");
         let encoder = match &*slot {
             Some(encoder) => encoder,
             None => {
-                let size = objc2_core_video::CVImageBufferGetEncodedSize(image);
+                // An encoder that failed to start fails the same way on every
+                // later frame, so stop asking and let the main loop report it
+                if self
+                    .fatal
+                    .lock()
+                    .expect("fatal mutex not poisoned")
+                    .is_some()
+                {
+                    return;
+                }
+                let (raw_width, raw_height) = frame_size(frame);
                 // Encoders require even dimensions.
-                let width = (size.width as i32) & !1;
-                let height = (size.height as i32) & !1;
+                let width = raw_width & !1;
+                let height = raw_height & !1;
                 if width <= 0 || height <= 0 {
                     return;
                 }
@@ -123,7 +144,8 @@ impl CaptureSink for Sender {
                         slot.insert(encoder)
                     }
                     Err(error) => {
-                        eprintln!("could not start encoder: {error}");
+                        *self.fatal.lock().expect("fatal mutex not poisoned") =
+                            Some(format!("could not start encoder: {error:#}"));
                         return;
                     }
                 }
@@ -132,7 +154,7 @@ impl CaptureSink for Sender {
         self.apply_bitrate_request(encoder);
 
         let force_key = self.keyframe_wanted.swap(false, Ordering::Relaxed);
-        if let Err(error) = encoder.encode(image, pts_micros, force_key) {
+        if let Err(error) = encoder.encode(frame, pts_micros, force_key) {
             eprintln!("encode failed: {error}");
             return;
         }
@@ -174,7 +196,7 @@ impl CaptureSink for Sender {
             None => {
                 if rate != self.settings.sample_rate {
                     println!(
-                        "audio: capturing at {} Hz (asked for {}; macOS chose the rate)",
+                        "audio: capturing at {} Hz (asked for {}; the system chose the rate)",
                         rate.hz(),
                         self.settings.sample_rate.hz()
                     );
@@ -234,6 +256,7 @@ pub fn run(options: Options) -> Result<()> {
         sample_rate: options.sample_rate,
         max_width: options.max_width,
         show_cursor: options.show_cursor,
+        audio_device: options.audio_device,
     };
 
     println!(
@@ -277,6 +300,7 @@ pub fn run(options: Options) -> Result<()> {
         audio_packets: AtomicU64::new(0),
         current_bps: std::sync::atomic::AtomicI32::new(options.bitrate_bps),
         audio_peak: AtomicU64::new(0),
+        fatal: Mutex::new(None),
     });
 
     let capture = Capture::start(&capture_options, sender.clone())?;
@@ -319,8 +343,23 @@ pub fn run(options: Options) -> Result<()> {
     println!("streaming; press Ctrl-C to stop");
     let start = Instant::now();
     let mut last = (0u64, 0u64);
+    // Checked every second so a fatal error ends the run promptly, while the
+    // statistics still cover five-second windows
+    let mut seconds = 0u64;
     loop {
-        std::thread::sleep(Duration::from_secs(5));
+        std::thread::sleep(Duration::from_secs(1));
+        if let Some(message) = sender
+            .fatal
+            .lock()
+            .expect("fatal mutex not poisoned")
+            .clone()
+        {
+            bail!(message);
+        }
+        seconds += 1;
+        if !seconds.is_multiple_of(5) {
+            continue;
+        }
         let frames = sender.frames_sent.load(Ordering::Relaxed);
         let bytes = sender.bytes_sent.load(Ordering::Relaxed);
         let mbps = (bytes - last.1) as f64 * 8.0 / 5.0 / 1_000_000.0;

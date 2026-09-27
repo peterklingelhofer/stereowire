@@ -43,10 +43,11 @@ pub struct DecodedFrame {
     pub pts_micros: u64,
 }
 
-/// Starts Media Foundation once per process; every `Decoder::new` calls this.
+/// Starts Media Foundation once per process. Every `Decoder::new` and
+/// `Encoder::new` calls this.
 static MF_STARTUP: OnceLock<std::result::Result<(), String>> = OnceLock::new();
 
-fn ensure_media_foundation() -> Result<()> {
+pub(super) fn ensure_media_foundation() -> Result<()> {
     MF_STARTUP
         .get_or_init(|| unsafe {
             // Apartment threaded, the mode cpal picks for WASAPI, because audio
@@ -1160,7 +1161,7 @@ fn expand_limited_range(byte: u8) -> u8 {
 
 /// Presentation timestamps travel in microseconds on the wire; Media
 /// Foundation counts in 100 ns units.
-fn micros_to_100ns(micros: u64) -> i64 {
+pub(super) fn micros_to_100ns(micros: u64) -> i64 {
     (micros as i64).saturating_mul(10)
 }
 

@@ -19,9 +19,7 @@ use anyhow::{bail, Context, Result};
 use stereowire_proto::jitter::AudioJitter;
 use stereowire_proto::packet::{fragment, Codec, Header, SampleRate, AUDIO_CHANNELS, MTU};
 use stereowire_proto::packetize::AudioPacketizer;
-use stereowire_proto::video::{Depacketizer, Received};
-#[cfg(target_os = "macos")]
-use stereowire_proto::video::{Frame, Framer};
+use stereowire_proto::video::{Depacketizer, Frame, Framer, Received};
 
 #[cfg(target_os = "macos")]
 use crate::mac::decoder::Decoder;
@@ -30,6 +28,8 @@ use crate::mac::encoder::Encoder;
 use crate::pattern::{psnr, TestPattern};
 #[cfg(windows)]
 use crate::win::decoder::Decoder;
+#[cfg(windows)]
+use crate::win::encoder::Encoder;
 
 /// Below this, compression artifacts become visible. At the bitrates this
 /// tool uses, a clean path scores far higher.
@@ -52,7 +52,6 @@ pub struct Options {
     /// Parity blocks per fragment group: one repairs a single loss, two repair
     /// any pair. Only `live_video` reads this: a replay carries its own
     /// parity, already baked into the dump.
-    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
     pub parity: usize,
     pub codec: Codec,
     /// Write every video datagram the encoder produced to this file.
@@ -280,9 +279,7 @@ impl Delivery {
 
 /// Captures the framer's raw output for later replay with `--replay`. The
 /// file write itself only happens in `finish`, so recording a datagram can
-/// never fail partway through a run. Only `live_video` builds one: a
-/// platform with no encoder has nothing of its own to dump.
-#[cfg(target_os = "macos")]
+/// never fail partway through a run. Only `live_video` builds one.
 struct DumpWriter {
     path: PathBuf,
     width: usize,
@@ -293,7 +290,6 @@ struct DumpWriter {
     count: u64,
 }
 
-#[cfg(target_os = "macos")]
 impl DumpWriter {
     fn new(path: PathBuf, width: usize, height: usize, fps: i32, frames: u32) -> Self {
         DumpWriter {
@@ -335,7 +331,6 @@ impl DumpWriter {
     }
 }
 
-#[cfg(target_os = "macos")]
 fn video_round_trip(options: &Options) -> Result<Outcome> {
     if let Some(path) = &options.replay {
         return replay_video(path, options);
@@ -343,20 +338,23 @@ fn video_round_trip(options: &Options) -> Result<Outcome> {
     live_video(options)
 }
 
-#[cfg(not(target_os = "macos"))]
-fn video_round_trip(options: &Options) -> Result<Outcome> {
-    if let Some(path) = &options.replay {
-        return replay_video(path, options);
-    }
-    bail!(
-        "this platform has no encoder; replay a dump made on a Mac with: \
-         stereowire selftest --codec h264 --dump pattern.swd"
-    )
+/// The encoder's input for frame `index`, in the form the platform's
+/// capture delivers.
+#[cfg(target_os = "macos")]
+fn pattern_frame(
+    pattern: &TestPattern,
+    index: u32,
+) -> Result<objc2_core_foundation::CFRetained<objc2_core_video::CVPixelBuffer>> {
+    Ok(pattern.frame(index)?.0)
+}
+
+#[cfg(windows)]
+fn pattern_frame(pattern: &TestPattern, index: u32) -> Result<crate::pattern::Nv12Frame> {
+    Ok(pattern.nv12(index))
 }
 
 /// Encodes the test pattern and delivers it, exactly as a live run does.
 /// Optionally captures every datagram to a dump file along the way.
-#[cfg(target_os = "macos")]
 fn live_video(options: &Options) -> Result<Outcome> {
     let pattern = TestPattern {
         width: options.width,
@@ -387,6 +385,9 @@ fn live_video(options: &Options) -> Result<Outcome> {
     let mut keyframes = 0u64;
     let mut keyframe_requests = 0u64;
     let mut dump_forced_keyframes = 0u64;
+    // Inputs submitted when the first output came back: how many frames the
+    // encoder holds before it releases any
+    let mut first_output_after = None;
     // Rate-limits recovery requests the way the real receiver does.
     let mut frames_since_request = u32::MAX;
     let request_interval = (options.fps.max(1) as u32) / 4;
@@ -396,7 +397,7 @@ fn live_video(options: &Options) -> Result<Outcome> {
     let dump_interval = (options.fps.max(1) as u32 / 4).max(1);
 
     for index in 0..options.frames {
-        let (buffer, _) = pattern.frame(index)?;
+        let input = pattern_frame(&pattern, index)?;
 
         let wants_recovery = delivery.wants_keyframe && frames_since_request >= request_interval;
         let dump_forced = dump.is_some() && index % dump_interval == 0;
@@ -413,9 +414,10 @@ fn live_video(options: &Options) -> Result<Outcome> {
         frames_since_request = frames_since_request.saturating_add(1);
 
         let pts = u64::from(index) * 1_000_000 / options.fps.max(1) as u64;
-        encoder.encode(&buffer, pts, force_key)?;
+        encoder.encode(&input, pts, force_key)?;
 
         for frame in encoder.drain() {
+            first_output_after.get_or_insert(index + 1);
             if frame.keyframe {
                 keyframes += 1;
             }
@@ -442,6 +444,7 @@ fn live_video(options: &Options) -> Result<Outcome> {
 
     encoder.finish()?;
     for frame in encoder.drain() {
+        first_output_after.get_or_insert(options.frames);
         if frame.keyframe {
             keyframes += 1;
         }
@@ -465,9 +468,13 @@ fn live_video(options: &Options) -> Result<Outcome> {
     std::thread::sleep(Duration::from_millis(100));
     delivery.drain(&link);
 
+    let latency = first_output_after.map_or_else(
+        || "no output at all".to_string(),
+        |inputs| format!("first output after {inputs} input frames"),
+    );
     println!(
         "  video: encoded {sent_frames} frames ({keyframes} keyframes, {keyframe_requests} from \
-         recovery requests, {dump_forced_keyframes} forced for the dump)"
+         recovery requests, {dump_forced_keyframes} forced for the dump), {latency}"
     );
 
     if let Some(dump) = dump {

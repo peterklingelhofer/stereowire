@@ -91,6 +91,10 @@ jobs:
         run: .\target\release\stereowire.exe selftest --replay pattern-h264.swd
       - name: Replay again with loss and reordering
         run: .\target\release\stereowire.exe selftest --replay pattern-h264.swd --loss 2 --reorder 5
+      # Exercises Microsoft's software H.264 encoder end to end on a real
+      # Windows runner, which no Wine on the Mac can do
+      - name: Self-test with the Windows encoder
+        run: .\target\release\stereowire.exe selftest --codec h264 --frames 60 --width 640 --height 360
       # A fresh runner has nothing installed, so this is the path a new
       # Windows user actually hits: no crash, and doctor still exits 0 with
       # the Tailscale hint printed

@@ -22,10 +22,20 @@ use objc2_screen_capture_kit::{
 };
 use stereowire_proto::packet::{SampleRate, AUDIO_CHANNELS};
 
+/// A captured video frame, in whatever type the platform's capture API
+/// delivers it as.
+pub type CapturedFrame = CVImageBuffer;
+
+/// Pixel dimensions the platform actually encoded the frame at.
+pub fn frame_size(frame: &CapturedFrame) -> (i32, i32) {
+    let size = objc2_core_video::CVImageBufferGetEncodedSize(frame);
+    (size.width as i32, size.height as i32)
+}
+
 /// Receives capture output. Called on ScreenCaptureKit's delivery queue, so
 /// implementations must not block.
 pub trait CaptureSink: Send + Sync {
-    fn on_video(&self, image: &CVImageBuffer, pts_micros: u64);
+    fn on_video(&self, frame: &CapturedFrame, pts_micros: u64);
     /// Interleaved stereo f32, at whatever rate the stream is actually running.
     ///
     /// `pts_micros` is on the same capture clock as [`CaptureSink::on_video`],
@@ -252,10 +262,19 @@ pub struct CaptureOptions {
     /// encoder and the link within budget.
     pub max_width: i32,
     pub show_cursor: bool,
+    /// Windows only. ScreenCaptureKit captures the system mix, so a request
+    /// is noted and ignored.
+    pub audio_device: Option<String>,
 }
 
 impl Capture {
     pub fn start(options: &CaptureOptions, sink: Arc<dyn CaptureSink>) -> Result<Self> {
+        if options.audio_device.is_some() {
+            println!(
+                "note: audio device selection applies to Windows only, ScreenCaptureKit \
+                 captures the system mix"
+            );
+        }
         let content = shareable_content()?;
         let displays = unsafe { content.displays() };
         let display = displays.firstObject().context(
