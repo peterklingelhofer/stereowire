@@ -22,6 +22,8 @@ use objc2_screen_capture_kit::{
 };
 use stereowire_proto::packet::{SampleRate, AUDIO_CHANNELS};
 
+use super::sample::micros_from;
+
 /// A captured video frame, in whatever type the platform's capture API
 /// delivers it as.
 pub type CapturedFrame = CVImageBuffer;
@@ -93,7 +95,7 @@ impl StreamOutput {
             return;
         };
         let pts = unsafe { sample.presentation_time_stamp() };
-        self.ivars().sink.on_video(&image, cmtime_micros(pts));
+        self.ivars().sink.on_video(&image, micros_from(pts));
     }
 
     fn handle_audio(&self, sample: &CMSampleBuffer) {
@@ -105,7 +107,7 @@ impl StreamOutput {
             }
             return;
         };
-        let pts = cmtime_micros(unsafe { sample.presentation_time_stamp() });
+        let pts = micros_from(unsafe { sample.presentation_time_stamp() });
         match unsafe { interleaved_audio(sample) } {
             Ok(samples) => self.ivars().sink.on_audio(&samples, rate, pts),
             Err(reason) => {
@@ -116,13 +118,6 @@ impl StreamOutput {
             }
         }
     }
-}
-
-fn cmtime_micros(time: CMTime) -> u64 {
-    if !time.flags.contains(CMTimeFlags::Valid) || time.timescale <= 0 {
-        return 0;
-    }
-    (time.value.max(0) as i128 * 1_000_000 / time.timescale as i128) as u64
 }
 
 /// The sample rate the capture is actually delivering.

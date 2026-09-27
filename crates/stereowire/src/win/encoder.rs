@@ -22,19 +22,18 @@
 //! colour description.
 
 use std::collections::VecDeque;
-use std::mem::ManuallyDrop;
 use std::sync::{Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, bail, Context, Result};
+use stereowire_proto::nal::{classify, parse_access_unit, split_annex_b, ParamSets};
 use stereowire_proto::packet::Codec;
-use windows::core::{Interface, GUID, PWSTR};
-use windows::Win32::Foundation::{S_OK, VARIANT_FALSE, VARIANT_TRUE};
+use windows::core::{Interface, GUID};
+use windows::Win32::Foundation::S_OK;
 use windows::Win32::Media::MediaFoundation::*;
-use windows::Win32::System::Com::{CoCreateInstance, CoTaskMemFree, CLSCTX_INPROC_SERVER};
-use windows::Win32::System::Variant::{VARIANT, VT_BOOL, VT_UI4};
+use windows::Win32::System::Com::{CoCreateInstance, CLSCTX_INPROC_SERVER};
 
-use super::decoder::{ensure_media_foundation, micros_to_100ns};
+use super::mf::{self, ProcessOutcome};
 use crate::pattern::Nv12Frame;
 
 /// One compressed frame, ready to put on the wire.
@@ -102,7 +101,7 @@ impl Encoder {
     /// software encoder by CLSID. `STEREOWIRE_SOFTWARE_ENCODER` skips the
     /// hardware ones.
     pub fn new(codec: Codec, width: i32, height: i32, bitrate_bps: i32, fps: i32) -> Result<Self> {
-        ensure_media_foundation()?;
+        mf::ensure_media_foundation()?;
         let config = Config {
             codec,
             width: width.max(2) as u32,
@@ -115,27 +114,36 @@ impl Encoder {
             Codec::Hevc => MFVideoFormat_HEVC,
         };
 
+        // Encoder MFTs taking NV12 in and producing `subtype`
+        let encoders = |flags| {
+            mf::enumerate(
+                MFT_CATEGORY_VIDEO_ENCODER,
+                flags,
+                Some(&MFVideoFormat_NV12),
+                Some(&subtype),
+            )
+        };
         let mut candidates = Vec::new();
         if std::env::var_os(SOFTWARE_ENCODER_VAR).is_none() {
-            candidates.extend(enumerate(
-                &subtype,
+            candidates.extend(encoders(
                 MFT_ENUM_FLAG_HARDWARE | MFT_ENUM_FLAG_ASYNCMFT | MFT_ENUM_FLAG_SORTANDFILTER,
             ));
         }
-        candidates.extend(enumerate(
-            &subtype,
+        candidates.extend(encoders(
             MFT_ENUM_FLAG_SYNCMFT | MFT_ENUM_FLAG_SORTANDFILTER,
         ));
 
         let mut last_error = None;
         for activate in candidates {
-            let name = friendly_name(&activate);
+            let name = mf::friendly_name(&activate);
             let label = name
                 .clone()
                 .unwrap_or_else(|| "an unnamed encoder".to_string());
             let started = unsafe { activate.ActivateObject::<IMFTransform>() }
                 .context("it would not activate")
-                .and_then(|mft| State::start(&mft, name, &config).inspect_err(|_| shut_down(&mft)));
+                .and_then(|mft| {
+                    State::start(&mft, name, &config).inspect_err(|_| mf::shut_down(&mft))
+                });
             match started {
                 Ok(state) => return Ok(Encoder::from(state)),
                 Err(error) => {
@@ -152,7 +160,7 @@ impl Encoder {
                 Ok(mft) => match State::start(&mft, None, &config) {
                     Ok(state) => return Ok(Encoder::from(state)),
                     Err(error) => {
-                        shut_down(&mft);
+                        mf::shut_down(&mft);
                         last_error = Some(error);
                     }
                 },
@@ -191,7 +199,7 @@ impl Encoder {
         unsafe {
             api.SetValue(
                 &CODECAPI_AVEncCommonMeanBitRate,
-                &variant_u32(bitrate_bps.max(1) as u32),
+                &mf::variant_u32(bitrate_bps.max(1) as u32),
             )
         }
         .context("the encoder refused the new bitrate")
@@ -238,13 +246,6 @@ struct Input {
     since: Instant,
 }
 
-/// What one `ProcessOutput` call produced.
-enum Output {
-    Sample(IMFSample),
-    NeedMoreInput,
-    StreamChanged,
-}
-
 struct State {
     mft: IMFTransform,
     codec_api: Option<ICodecAPI>,
@@ -277,7 +278,7 @@ struct State {
 
 impl Drop for State {
     fn drop(&mut self) {
-        shut_down(&self.mft);
+        mf::shut_down(&self.mft);
     }
 }
 
@@ -397,9 +398,16 @@ impl State {
             .data
             .get(..self.width * self.height * 3 / 2)
             .context("the frame holds less than a whole NV12 picture")?;
-        let time = micros_to_100ns(pts_micros);
+        let time = mf::micros_to_100ns(pts_micros);
+        // A fresh sample per frame, since an encoder may keep hold of its
+        // input until it is done with it
+        let sample = mf::sample_with_bytes(picture)?;
+        unsafe {
+            sample.SetSampleTime(time)?;
+            sample.SetSampleDuration(self.frame_duration)?;
+        }
         let input = Input {
-            sample: input_sample(picture, time, self.frame_duration)?,
+            sample,
             time,
             pts_micros,
             force_keyframe,
@@ -473,11 +481,11 @@ impl State {
                 self.need_input += 1;
             } else if kind == METransformHaveOutput.0 as u32 {
                 match self.process_output()? {
-                    Output::Sample(sample) => self.take_output(&sample)?,
-                    Output::NeedMoreInput => {}
+                    ProcessOutcome::Sample(sample) => self.take_output(&sample)?,
+                    ProcessOutcome::NeedMoreInput => {}
                     // The encoder sends another METransformHaveOutput for
                     // the frame once the new type is set
-                    Output::StreamChanged => self.renegotiate()?,
+                    ProcessOutcome::StreamChange => self.renegotiate()?,
                 }
             } else if kind == METransformDrainComplete.0 as u32 {
                 self.drained = true;
@@ -521,9 +529,9 @@ impl State {
         let mut changes = 0;
         loop {
             match self.process_output()? {
-                Output::Sample(sample) => self.take_output(&sample)?,
-                Output::NeedMoreInput => return Ok(()),
-                Output::StreamChanged => {
+                ProcessOutcome::Sample(sample) => self.take_output(&sample)?,
+                ProcessOutcome::NeedMoreInput => return Ok(()),
+                ProcessOutcome::StreamChange => {
                     changes += 1;
                     if changes > 3 {
                         bail!("the encoder keeps changing its output type");
@@ -534,7 +542,7 @@ impl State {
         }
     }
 
-    fn process_output(&mut self) -> Result<Output> {
+    fn process_output(&mut self) -> Result<ProcessOutcome> {
         let flags = MFT_OUTPUT_STREAM_PROVIDES_SAMPLES.0 | MFT_OUTPUT_STREAM_CAN_PROVIDE_SAMPLES.0;
         let own_sample = if self.stream_info.dwFlags & flags as u32 != 0 {
             None
@@ -545,34 +553,9 @@ impl State {
                 0 => (self.width * self.height * 3 / 2 + 65_536) as u32,
                 size => size,
             };
-            Some(output_sample(size)?)
+            Some(mf::empty_sample(size)?)
         };
-        let mut buffer = MFT_OUTPUT_DATA_BUFFER {
-            dwStreamID: 0,
-            pSample: ManuallyDrop::new(own_sample),
-            dwStatus: 0,
-            pEvents: ManuallyDrop::new(None),
-        };
-        let mut status = 0u32;
-        let outcome = unsafe {
-            self.mft
-                .ProcessOutput(0, std::slice::from_mut(&mut buffer), &mut status)
-        };
-        // Reclaim ownership so whatever ended up in the buffer is released
-        // whichever branch below is taken
-        let sample = unsafe { ManuallyDrop::take(&mut buffer.pSample) };
-        let _events = unsafe { ManuallyDrop::take(&mut buffer.pEvents) };
-
-        match outcome {
-            Ok(()) => Ok(Output::Sample(
-                sample.context("ProcessOutput succeeded without producing a sample")?,
-            )),
-            Err(error) if error.code() == MF_E_TRANSFORM_NEED_MORE_INPUT => {
-                Ok(Output::NeedMoreInput)
-            }
-            Err(error) if error.code() == MF_E_TRANSFORM_STREAM_CHANGE => Ok(Output::StreamChanged),
-            Err(error) => Err(error).context("ProcessOutput failed"),
-        }
+        mf::process_output(&self.mft, own_sample)
     }
 
     /// Turns one output sample into an `EncodedFrame`, with its parameter
@@ -595,7 +578,7 @@ impl State {
         let pts_micros = self
             .timestamps
             .pop(time)
-            .unwrap_or_else(|| time.unwrap_or(0).max(0) as u64 / 10);
+            .unwrap_or_else(|| mf::hundred_ns_to_micros(time.unwrap_or(0)));
         self.ready.push(EncodedFrame {
             data: unit.data,
             keyframe: unit.keyframe || clean_point,
@@ -655,7 +638,7 @@ impl State {
     fn force_keyframe(&mut self) {
         let result = match &self.codec_api {
             Some(api) => {
-                unsafe { api.SetValue(&CODECAPI_AVEncVideoForceKeyFrame, &variant_u32(1)) }
+                unsafe { api.SetValue(&CODECAPI_AVEncVideoForceKeyFrame, &mf::variant_u32(1)) }
                     .map_err(|error| error.to_string())
             }
             None => Err("it has no ICodecAPI".to_string()),
@@ -722,64 +705,6 @@ impl State {
     }
 }
 
-/// Releases an MFT's worker threads and event queue. Asynchronous encoders
-/// need this, and it is harmless on the rest.
-fn shut_down(mft: &IMFTransform) {
-    if let Ok(shutdown) = mft.cast::<IMFShutdown>() {
-        let _ = unsafe { shutdown.Shutdown() };
-    }
-}
-
-/// Encoder MFTs taking NV12 in and producing `subtype`, in the order
-/// `MFTEnumEx` ranks them.
-fn enumerate(subtype: &GUID, flags: MFT_ENUM_FLAG) -> Vec<IMFActivate> {
-    let input = MFT_REGISTER_TYPE_INFO {
-        guidMajorType: MFMediaType_Video,
-        guidSubtype: MFVideoFormat_NV12,
-    };
-    let output = MFT_REGISTER_TYPE_INFO {
-        guidMajorType: MFMediaType_Video,
-        guidSubtype: *subtype,
-    };
-    let mut activates: *mut Option<IMFActivate> = std::ptr::null_mut();
-    let mut count = 0u32;
-    let result = unsafe {
-        MFTEnumEx(
-            MFT_CATEGORY_VIDEO_ENCODER,
-            flags,
-            Some(&input),
-            Some(&output),
-            &mut activates,
-            &mut count,
-        )
-    };
-    let mut found = Vec::new();
-    if activates.is_null() {
-        return found;
-    }
-    if result.is_ok() {
-        for index in 0..count as usize {
-            // MFTEnumEx hands over one reference per entry, which reading
-            // the entry out takes over
-            if let Some(activate) = unsafe { std::ptr::read(activates.add(index)) } {
-                found.push(activate);
-            }
-        }
-    }
-    unsafe { CoTaskMemFree(Some(activates as *const core::ffi::c_void)) };
-    found
-}
-
-fn friendly_name(activate: &IMFActivate) -> Option<String> {
-    let mut value = PWSTR::null();
-    let mut length = 0u32;
-    unsafe { activate.GetAllocatedString(&MFT_FRIENDLY_NAME_Attribute, &mut value, &mut length) }
-        .ok()?;
-    let name = unsafe { value.to_string() }.ok();
-    unsafe { CoTaskMemFree(Some(value.0 as *const core::ffi::c_void)) };
-    name.filter(|name| !name.trim().is_empty())
-}
-
 /// One `ICodecAPI` property the encoder is asked to take.
 struct Setting {
     name: &'static str,
@@ -844,43 +769,17 @@ fn apply_settings(api: Option<&ICodecAPI>, settings: &[Setting]) -> Vec<bool> {
                 return false;
             };
             let first = if setting.boolean {
-                variant_bool(setting.value != 0)
+                mf::variant_bool(setting.value != 0)
             } else {
-                variant_u32(setting.value)
+                mf::variant_u32(setting.value)
             };
             unsafe { api.SetValue(&setting.api, &first) }.is_ok()
                 // Implementations disagree on the type of the boolean ones
                 || (setting.boolean
-                    && unsafe { api.SetValue(&setting.api, &variant_u32(setting.value)) }.is_ok())
+                    && unsafe { api.SetValue(&setting.api, &mf::variant_u32(setting.value)) }
+                        .is_ok())
         })
         .collect()
-}
-
-fn variant_u32(value: u32) -> VARIANT {
-    let mut variant = VARIANT::default();
-    unsafe {
-        // VARIANT.Anonymous.Anonymous is a ManuallyDrop reached through a
-        // union field, so assignments go through an explicit `*`
-        (*variant.Anonymous.Anonymous).vt = VT_UI4;
-        (*variant.Anonymous.Anonymous).Anonymous.ulVal = value;
-    }
-    variant
-}
-
-fn variant_bool(value: bool) -> VARIANT {
-    let mut variant = VARIANT::default();
-    unsafe {
-        (*variant.Anonymous.Anonymous).vt = VT_BOOL;
-        (*variant.Anonymous.Anonymous).Anonymous.boolVal =
-            if value { VARIANT_TRUE } else { VARIANT_FALSE };
-    }
-    variant
-}
-
-/// Two 32-bit values packed the way Media Foundation's size and ratio
-/// attributes store them.
-fn pack(high: u32, low: u32) -> u64 {
-    (u64::from(high) << 32) | u64::from(low)
 }
 
 /// A video media type carrying what the input and output types share.
@@ -889,8 +788,8 @@ fn video_type(subtype: &GUID, config: &Config) -> Result<IMFMediaType> {
     unsafe {
         media_type.SetGUID(&MF_MT_MAJOR_TYPE, &MFMediaType_Video)?;
         media_type.SetGUID(&MF_MT_SUBTYPE, subtype)?;
-        media_type.SetUINT64(&MF_MT_FRAME_SIZE, pack(config.width, config.height))?;
-        media_type.SetUINT64(&MF_MT_FRAME_RATE, pack(config.fps, 1))?;
+        media_type.SetUINT64(&MF_MT_FRAME_SIZE, mf::pack(config.width, config.height))?;
+        media_type.SetUINT64(&MF_MT_FRAME_RATE, mf::pack(config.fps, 1))?;
         media_type.SetUINT32(&MF_MT_INTERLACE_MODE, MFVideoInterlace_Progressive.0 as u32)?;
     }
     Ok(media_type)
@@ -943,34 +842,6 @@ fn set_input_type(mft: &IMFTransform, config: &Config) -> Result<bool> {
     )
 }
 
-/// Copies one NV12 picture into a sample. A fresh sample per frame, since
-/// an encoder may keep hold of its input until it is done with it.
-fn input_sample(picture: &[u8], time: i64, duration: i64) -> Result<IMFSample> {
-    let buffer = unsafe { MFCreateMemoryBuffer(picture.len() as u32) }
-        .context("MFCreateMemoryBuffer failed")?;
-    unsafe {
-        let mut ptr = std::ptr::null_mut();
-        buffer.Lock(&mut ptr, None, None)?;
-        std::ptr::copy_nonoverlapping(picture.as_ptr(), ptr, picture.len());
-        buffer.Unlock()?;
-        buffer.SetCurrentLength(picture.len() as u32)?;
-    }
-    let sample = unsafe { MFCreateSample() }.context("MFCreateSample failed")?;
-    unsafe {
-        sample.AddBuffer(&buffer)?;
-        sample.SetSampleTime(time)?;
-        sample.SetSampleDuration(duration)?;
-    }
-    Ok(sample)
-}
-
-fn output_sample(size: u32) -> Result<IMFSample> {
-    let buffer = unsafe { MFCreateMemoryBuffer(size) }.context("MFCreateMemoryBuffer failed")?;
-    let sample = unsafe { MFCreateSample() }.context("MFCreateSample failed")?;
-    unsafe { sample.AddBuffer(&buffer) }.context("AddBuffer failed")?;
-    Ok(sample)
-}
-
 fn sample_bytes(sample: &IMFSample) -> Result<Vec<u8>> {
     let buffer = unsafe { sample.ConvertToContiguousBuffer() }
         .context("ConvertToContiguousBuffer failed")?;
@@ -984,152 +855,6 @@ fn sample_bytes(sample: &IMFSample) -> Result<Vec<u8>> {
     };
     unsafe { buffer.Unlock() }.context("Unlock failed")?;
     Ok(bytes)
-}
-
-/// Splits an Annex B byte stream into NAL units, start codes removed.
-///
-/// Each unit runs to the next `00 00 01`. Trailing zero bytes are trimmed,
-/// which removes the extra leading zero of a 4-byte start code and any
-/// `trailing_zero_8bits`, since a NAL unit never ends in a zero byte.
-fn split_annex_b(stream: &[u8]) -> Vec<&[u8]> {
-    let mut units = Vec::new();
-    let mut start = None;
-    let mut i = 0;
-    while i + 3 <= stream.len() {
-        if stream[i] == 0 && stream[i + 1] == 0 && stream[i + 2] == 1 {
-            if let Some(start) = start {
-                units.push(trim_trailing_zeros(&stream[start..i]));
-            }
-            i += 3;
-            start = Some(i);
-        } else {
-            i += 1;
-        }
-    }
-    if let Some(start) = start {
-        units.push(trim_trailing_zeros(&stream[start..]));
-    }
-    units.retain(|unit| !unit.is_empty());
-    units
-}
-
-fn trim_trailing_zeros(unit: &[u8]) -> &[u8] {
-    let end = unit
-        .iter()
-        .rposition(|&b| b != 0)
-        .map_or(0, |last| last + 1);
-    &unit[..end]
-}
-
-/// What a NAL unit is, as far as the wire format cares.
-#[derive(Clone, Copy, Debug, PartialEq)]
-enum Nal {
-    Vps,
-    Sps,
-    Pps,
-    /// A slice of an IDR picture, or for HEVC of any random access point.
-    Keyframe,
-    Slice,
-    Sei,
-    /// Access unit delimiters, filler and the rest, none of which a decoder
-    /// needs.
-    Other,
-}
-
-fn classify(codec: Codec, unit: &[u8]) -> Nal {
-    let Some(&header) = unit.first() else {
-        return Nal::Other;
-    };
-    match codec {
-        Codec::H264 => match header & 0x1F {
-            5 => Nal::Keyframe,
-            1..=4 => Nal::Slice,
-            6 => Nal::Sei,
-            7 => Nal::Sps,
-            8 => Nal::Pps,
-            _ => Nal::Other,
-        },
-        Codec::Hevc => match (header >> 1) & 0x3F {
-            16..=23 => Nal::Keyframe,
-            0..=31 => Nal::Slice,
-            32 => Nal::Vps,
-            33 => Nal::Sps,
-            34 => Nal::Pps,
-            39 | 40 => Nal::Sei,
-            _ => Nal::Other,
-        },
-    }
-}
-
-/// The latest parameter sets seen.
-#[derive(Default)]
-struct ParamSets {
-    vps: Option<Vec<u8>>,
-    sps: Option<Vec<u8>>,
-    pps: Option<Vec<u8>>,
-}
-
-impl ParamSets {
-    fn absorb(&mut self, kind: Nal, unit: &[u8]) {
-        let slot = match kind {
-            Nal::Vps => &mut self.vps,
-            Nal::Sps => &mut self.sps,
-            Nal::Pps => &mut self.pps,
-            _ => return,
-        };
-        *slot = Some(unit.to_vec());
-    }
-
-    fn complete(&self, codec: Codec) -> bool {
-        self.sps.is_some() && self.pps.is_some() && (codec == Codec::H264 || self.vps.is_some())
-    }
-
-    /// SPS then PPS for H.264, with the VPS first for HEVC: the order the
-    /// wire carries them in. Empty until every one has been seen.
-    fn list(&self, codec: Codec) -> Vec<Vec<u8>> {
-        let wanted = match codec {
-            Codec::H264 => vec![&self.sps, &self.pps],
-            Codec::Hevc => vec![&self.vps, &self.sps, &self.pps],
-        };
-        wanted
-            .into_iter()
-            .cloned()
-            .collect::<Option<Vec<_>>>()
-            .unwrap_or_default()
-    }
-}
-
-/// One output sample, with its parameter sets set aside.
-struct AccessUnit {
-    /// Slice and SEI NAL units, each behind a 4-byte big-endian length.
-    data: Vec<u8>,
-    /// Whether any slice is present. Without one the sample is no frame.
-    has_slices: bool,
-    keyframe: bool,
-}
-
-/// Sorts an Annex B access unit: parameter sets go into `params`, slices and
-/// SEI into `data` with their lengths in front, and the rest is dropped.
-fn parse_access_unit(codec: Codec, stream: &[u8], params: &mut ParamSets) -> AccessUnit {
-    let mut unit = AccessUnit {
-        data: Vec::with_capacity(stream.len() + 16),
-        has_slices: false,
-        keyframe: false,
-    };
-    for nal in split_annex_b(stream) {
-        match classify(codec, nal) {
-            kind @ (Nal::Vps | Nal::Sps | Nal::Pps) => params.absorb(kind, nal),
-            kind @ (Nal::Keyframe | Nal::Slice | Nal::Sei) => {
-                unit.data
-                    .extend_from_slice(&(nal.len() as u32).to_be_bytes());
-                unit.data.extend_from_slice(nal);
-                unit.has_slices |= kind != Nal::Sei;
-                unit.keyframe |= kind == Nal::Keyframe;
-            }
-            Nal::Other => {}
-        }
-    }
-    unit
 }
 
 /// Input timestamps in submission order, handed back to outputs.
@@ -1191,100 +916,6 @@ impl Timestamps {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use stereowire_proto::video::annex_b;
-
-    const SPS: &[u8] = &[0x67, 0x64, 0x00, 0x1f, 0xac];
-    const PPS: &[u8] = &[0x68, 0xee, 0x3c, 0x80];
-    const AUD: &[u8] = &[0x09, 0xf0];
-    const SEI: &[u8] = &[0x06, 0x05, 0x01, 0x80];
-    const IDR: &[u8] = &[0x65, 0x88, 0x84, 0x00, 0x33];
-    const SLICE: &[u8] = &[0x41, 0x9a, 0x21, 0x6c];
-
-    /// Joins NAL units into Annex B with 4-byte start codes, the form Media
-    /// Foundation encoders emit.
-    fn annex(units: &[&[u8]]) -> Vec<u8> {
-        units
-            .iter()
-            .flat_map(|unit| [&[0u8, 0, 0, 1][..], unit].concat())
-            .collect()
-    }
-
-    #[test]
-    fn split_annex_b_handles_both_start_code_lengths() {
-        let mut stream = annex(&[AUD, SPS]);
-        stream.extend_from_slice(&[0, 0, 1]);
-        stream.extend_from_slice(IDR);
-        assert_eq!(split_annex_b(&stream), vec![AUD, SPS, IDR]);
-    }
-
-    #[test]
-    fn split_annex_b_drops_trailing_zeros_and_leading_junk() {
-        let mut stream = vec![0u8, 0];
-        stream.extend(annex(&[SLICE]));
-        // trailing_zero_8bits after the last unit
-        stream.extend_from_slice(&[0, 0]);
-        assert_eq!(split_annex_b(&stream), vec![SLICE]);
-        assert!(split_annex_b(&[0, 0, 0]).is_empty());
-    }
-
-    #[test]
-    fn parameter_sets_are_set_aside_and_listed_in_wire_order() {
-        let mut params = ParamSets::default();
-        let unit = parse_access_unit(Codec::H264, &annex(&[AUD, SPS, PPS, SEI, IDR]), &mut params);
-        assert_eq!(params.list(Codec::H264), vec![SPS.to_vec(), PPS.to_vec()]);
-        // HEVC needs a VPS too, which an H.264 stream never has
-        assert!(params.list(Codec::Hevc).is_empty());
-        assert!(unit.has_slices);
-    }
-
-    #[test]
-    fn parameter_sets_list_nothing_until_complete() {
-        let mut params = ParamSets::default();
-        parse_access_unit(Codec::H264, &annex(&[SPS, SLICE]), &mut params);
-        assert!(!params.complete(Codec::H264));
-        assert!(params.list(Codec::H264).is_empty());
-        parse_access_unit(Codec::H264, &annex(&[PPS, SLICE]), &mut params);
-        assert!(params.complete(Codec::H264));
-        assert!(!params.complete(Codec::Hevc));
-        assert_eq!(params.list(Codec::H264).len(), 2);
-    }
-
-    #[test]
-    fn length_prefixed_data_round_trips_through_annex_b() {
-        let mut params = ParamSets::default();
-        let unit = parse_access_unit(Codec::H264, &annex(&[AUD, SPS, PPS, SEI, IDR]), &mut params);
-        // The access unit delimiter is gone, and the parameter sets come
-        // back in front, the way the receiver rebuilds a stream
-        assert_eq!(
-            annex_b(&params.list(Codec::H264), &unit.data),
-            annex(&[SPS, PPS, SEI, IDR])
-        );
-        assert_eq!(annex_b(&[], &unit.data), annex(&[SEI, IDR]));
-    }
-
-    #[test]
-    fn keyframes_are_recognised_by_nal_type() {
-        let mut params = ParamSets::default();
-        assert!(parse_access_unit(Codec::H264, &annex(&[SPS, PPS, IDR]), &mut params).keyframe);
-        assert!(!parse_access_unit(Codec::H264, &annex(&[AUD, SLICE]), &mut params).keyframe);
-        // SEI alone is no frame at all
-        assert!(!parse_access_unit(Codec::H264, &annex(&[SEI]), &mut params).has_slices);
-
-        // HEVC keeps the type in bits 1-6 of a two-byte header: 19 is
-        // IDR_W_RADL, 1 is TRAIL_R, 32-34 are VPS, SPS and PPS
-        let vps: &[u8] = &[0x40, 0x01, 0x0c];
-        let sps: &[u8] = &[0x42, 0x01, 0x01];
-        let pps: &[u8] = &[0x44, 0x01, 0xc0];
-        let idr: &[u8] = &[0x26, 0x01, 0xaf];
-        let trail: &[u8] = &[0x02, 0x01, 0xd0];
-        let unit = parse_access_unit(Codec::Hevc, &annex(&[vps, sps, pps, idr]), &mut params);
-        assert!(unit.keyframe);
-        assert_eq!(
-            params.list(Codec::Hevc),
-            vec![vps.to_vec(), sps.to_vec(), pps.to_vec()]
-        );
-        assert!(!parse_access_unit(Codec::Hevc, &annex(&[trail]), &mut params).keyframe);
-    }
 
     /// Frame times at 60 fps in 100 ns units, and their `pts_micros`.
     fn queue(frames: usize, slack: usize) -> Timestamps {

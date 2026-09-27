@@ -3,6 +3,7 @@ pub mod capture;
 pub mod decoder;
 mod desktop;
 pub mod encoder;
+mod mf;
 mod pixels;
 pub mod render;
 pub mod viewer;

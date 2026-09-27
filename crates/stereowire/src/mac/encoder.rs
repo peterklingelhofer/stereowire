@@ -14,7 +14,6 @@ use objc2::runtime::AnyObject;
 use objc2_core_foundation::{CFRetained, CFString, CFType};
 use objc2_core_media::{
     kCMSampleAttachmentKey_NotSync, kCMVideoCodecType_H264, kCMVideoCodecType_HEVC, CMSampleBuffer,
-    CMTime, CMTimeFlags,
 };
 use objc2_core_video::CVImageBuffer;
 use objc2_foundation::{NSDictionary, NSNumber, NSString};
@@ -30,6 +29,7 @@ use objc2_video_toolbox::{
 use stereowire_proto::packet::Codec;
 
 use super::cf;
+use super::sample::{invalid_time, micros, micros_from};
 
 /// One compressed frame, ready to put on the wire.
 pub struct EncodedFrame {
@@ -42,10 +42,6 @@ pub struct EncodedFrame {
     /// build a decoder at all until the next one, seconds later.
     pub params: Vec<Vec<u8>>,
 }
-
-/// Presentation timestamps are kept in microseconds so the wire format can use
-/// a plain integer.
-const TIMESCALE: i32 = 1_000_000;
 
 /// Carried through the C callback's refcon: the codec is needed to read back
 /// the right kind of parameter sets, alongside the channel to the encoder.
@@ -173,12 +169,6 @@ impl Encoder {
         pts_micros: u64,
         force_keyframe: bool,
     ) -> Result<()> {
-        let pts = CMTime {
-            value: pts_micros as i64,
-            timescale: TIMESCALE,
-            flags: CMTimeFlags::Valid,
-            epoch: 0,
-        };
         let properties = force_keyframe.then(|| {
             cf::dict(&[(
                 unsafe { kVTEncodeFrameOptionKey_ForceKeyFrame },
@@ -189,14 +179,9 @@ impl Encoder {
         let status = unsafe {
             self.session.encode_frame(
                 image,
-                pts,
+                micros(pts_micros),
                 // Unknown duration; the encoder infers cadence from timestamps.
-                CMTime {
-                    value: 0,
-                    timescale: 0,
-                    flags: CMTimeFlags::empty(),
-                    epoch: 0,
-                },
+                invalid_time(),
                 properties.as_deref().map(cf::as_cf_dict),
                 std::ptr::null_mut(),
                 &mut info,
@@ -218,14 +203,7 @@ impl Encoder {
     /// Blocks until every submitted frame has been emitted.
     pub fn finish(&self) -> Result<()> {
         // An invalid deadline means "complete everything outstanding".
-        let status = unsafe {
-            self.session.complete_frames(CMTime {
-                value: 0,
-                timescale: 0,
-                flags: CMTimeFlags::empty(),
-                epoch: 0,
-            })
-        };
+        let status = unsafe { self.session.complete_frames(invalid_time()) };
         if status != 0 {
             bail!("VTCompressionSessionCompleteFrames failed with status {status}");
         }
@@ -311,14 +289,7 @@ unsafe fn extract(sample: &CMSampleBuffer, codec: Codec) -> Option<EncodedFrame>
         return None;
     }
 
-    let pts = unsafe { sample.presentation_time_stamp() };
-    let pts_micros = if pts.timescale == TIMESCALE {
-        pts.value.max(0) as u64
-    } else if pts.timescale > 0 {
-        (pts.value.max(0) as i128 * TIMESCALE as i128 / pts.timescale as i128) as u64
-    } else {
-        0
-    };
+    let pts_micros = micros_from(unsafe { sample.presentation_time_stamp() });
 
     // Parameter sets live in the format description rather than the bitstream,
     // so they have to be carried alongside the frames themselves.

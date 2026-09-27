@@ -153,15 +153,10 @@ unsafe extern "C-unwind" fn on_decoded(
     if luma.is_empty() {
         return;
     }
-    let pts_micros = if pts.timescale > 0 {
-        (pts.value.max(0) as i128 * sample::TIMESCALE as i128 / pts.timescale as i128) as u64
-    } else {
-        0
-    };
     let _ = sink.send(DecodedFrame {
         luma,
         width,
         height,
-        pts_micros,
+        pts_micros: sample::micros_from(pts),
     });
 }

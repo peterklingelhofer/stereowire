@@ -226,15 +226,6 @@ pub fn run(
     Ok(())
 }
 
-/// The next frame the depacketizer will release, or `None` when it has nothing
-/// more that is in order.
-fn next_ready(video: &mut Depacketizer) -> Option<Received> {
-    match video.poll() {
-        Received::Pending => None,
-        ready => Some(ready),
-    }
-}
-
 /// Builds the one-line link summary shown in the title bar.
 fn describe_link(
     rtt: &Arc<std::sync::Mutex<Rtt>>,
@@ -345,9 +336,9 @@ fn receive_loop(
                 video.push(header, body);
                 // One arrival can release several frames when it fills a gap,
                 // so drain until nothing more is in order.
-                while let Some(ready) = next_ready(&mut video) {
-                    match ready {
-                        Received::Pending => {}
+                loop {
+                    match video.poll() {
+                        Received::Pending => break,
                         Received::Frame {
                             params,
                             data,

@@ -581,3 +581,35 @@ fn fit_viewport(
         MaxDepth: 1.0,
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Where `fit_viewport` puts 2:1 content in the client area, as
+    /// (x, y, width, height).
+    fn placement(client_width: u32, client_height: u32) -> (f32, f32, f32, f32) {
+        let viewport = fit_viewport(client_width, client_height, 1280, 640);
+        (
+            viewport.TopLeftX,
+            viewport.TopLeftY,
+            viewport.Width,
+            viewport.Height,
+        )
+    }
+
+    #[test]
+    fn a_wider_client_fills_the_height_and_centres_across() {
+        assert_eq!(placement(1000, 400), (100.0, 0.0, 800.0, 400.0));
+    }
+
+    #[test]
+    fn a_taller_client_fills_the_width_and_centres_down() {
+        assert_eq!(placement(400, 400), (0.0, 100.0, 400.0, 200.0));
+    }
+
+    #[test]
+    fn a_client_of_the_same_aspect_is_filled_exactly() {
+        assert_eq!(placement(640, 320), (0.0, 0.0, 640.0, 320.0));
+    }
+}

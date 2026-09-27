@@ -36,6 +36,17 @@ pub fn micros(value: u64) -> CMTime {
     }
 }
 
+/// A CoreMedia time in microseconds, or 0 when it is invalid.
+pub fn micros_from(time: CMTime) -> u64 {
+    if !time.flags.contains(CMTimeFlags::Valid) || time.timescale <= 0 {
+        return 0;
+    }
+    if time.timescale == TIMESCALE {
+        return time.value.max(0) as u64;
+    }
+    (time.value.max(0) as i128 * TIMESCALE as i128 / time.timescale as i128) as u64
+}
+
 /// Builds a decoder format description from HEVC or H.264 parameter sets.
 pub fn format_from_params(
     codec: Codec,
@@ -150,4 +161,29 @@ fn block_buffer(data: &[u8]) -> Result<CFRetained<CMBlockBuffer>> {
         bail!("CMBlockBufferReplaceDataBytes failed with status {status}");
     }
     Ok(block)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn micros_from_reads_valid_times_at_any_timescale() {
+        let time = |value, timescale, flags| CMTime {
+            value,
+            timescale,
+            flags,
+            epoch: 0,
+        };
+        assert_eq!(micros_from(time(5, TIMESCALE, CMTimeFlags::empty())), 0);
+        assert_eq!(
+            micros_from(time(1_234_567, TIMESCALE, CMTimeFlags::Valid)),
+            1_234_567
+        );
+        // A 90 kHz clock, as RTP video uses: 135_000 ticks is 1.5 s
+        assert_eq!(
+            micros_from(time(135_000, 90_000, CMTimeFlags::Valid)),
+            1_500_000
+        );
+    }
 }

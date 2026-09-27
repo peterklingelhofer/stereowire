@@ -22,34 +22,6 @@ pub struct Frame<'a> {
     pub codec: Codec,
 }
 
-/// Converts VideoToolbox's length-prefixed NAL units to Annex B.
-///
-/// VideoToolbox emits NAL units with a 4-byte big-endian length prefix. This
-/// returns the parameter sets, then every NAL unit of `data`, each preceded by
-/// the start code `00 00 00 01`, which is the form Windows Media Foundation
-/// and browsers' WebCodecs expect. Stops at the first malformed length (one
-/// that runs past the end) and returns what parsed so far.
-pub fn annex_b(params: &[Vec<u8>], data: &[u8]) -> Vec<u8> {
-    const START_CODE: [u8; 4] = [0, 0, 0, 1];
-    let mut out = Vec::with_capacity(data.len() + data.len() / 8 + 32);
-    for set in params {
-        out.extend_from_slice(&START_CODE);
-        out.extend_from_slice(set);
-    }
-    let mut rest = data;
-    while rest.len() >= 4 {
-        let (len_bytes, tail) = rest.split_at(4);
-        let len = u32::from_be_bytes(len_bytes.try_into().expect("checked 4 bytes")) as usize;
-        if len > tail.len() {
-            break;
-        }
-        out.extend_from_slice(&START_CODE);
-        out.extend_from_slice(&tail[..len]);
-        rest = &tail[len..];
-    }
-    out
-}
-
 /// Numbers frames, splits them into datagrams, and adds parity.
 pub struct Framer {
     seq: u64,
@@ -917,33 +889,5 @@ mod tests {
             Received::Frame { codec, .. } => assert_eq!(codec, Codec::Hevc),
             other => panic!("expected a decodable frame, got {other:?}"),
         }
-    }
-
-    #[test]
-    fn annex_b_prefixes_params_and_each_nal_unit_with_a_start_code() {
-        let params = vec![vec![1u8, 2, 3], vec![4u8, 5]];
-        let nal_units = [vec![9u8, 9, 9], vec![7u8, 7]];
-        let mut data = Vec::new();
-        for nal in &nal_units {
-            data.extend_from_slice(&(nal.len() as u32).to_be_bytes());
-            data.extend_from_slice(nal);
-        }
-
-        let out = annex_b(&params, &data);
-
-        let mut expected = Vec::new();
-        for set in params.iter().chain(nal_units.iter()) {
-            expected.extend_from_slice(&[0, 0, 0, 1]);
-            expected.extend_from_slice(set);
-        }
-        assert_eq!(out, expected);
-    }
-
-    #[test]
-    fn annex_b_stops_at_a_length_that_runs_past_the_end() {
-        let mut data = 100u32.to_be_bytes().to_vec();
-        data.extend_from_slice(&[1, 2, 3]);
-        // The claimed length is longer than the three bytes that follow it.
-        assert!(annex_b(&[], &data).is_empty());
     }
 }
