@@ -122,7 +122,7 @@ pub fn downscale_half(
     for (y, out_row) in out.chunks_exact_mut(out_width * 4).enumerate() {
         let top = &source[2 * y * stride..];
         let bottom = &source[(2 * y + 1) * stride..];
-        for (x, pixel) in out_row.chunks_exact_mut(4).enumerate() {
+        for (x, pixel) in out_row.as_chunks_mut::<4>().0.iter_mut().enumerate() {
             let at = x * 8;
             for (channel, value) in pixel.iter_mut().enumerate() {
                 let sum = u32::from(top[at + channel])
@@ -158,16 +158,16 @@ pub fn bgra_to_nv12(source: &[u8], width: usize, height: usize, out: &mut Vec<u8
         ];
         for (row, source_row) in rows.iter().enumerate() {
             let luma_row = &mut luma[(y + row) * width..(y + row + 1) * width];
-            for (value, pixel) in luma_row.iter_mut().zip(source_row.chunks_exact(4)) {
+            for (value, pixel) in luma_row.iter_mut().zip(source_row.as_chunks::<4>().0) {
                 *value = luma_of(pixel);
             }
         }
-        for (x, uv) in uv_row.chunks_exact_mut(2).enumerate() {
+        for (x, uv) in uv_row.as_chunks_mut::<2>().0.iter_mut().enumerate() {
             let at = x * 8;
             // Summed B, G and R of the block's four pixels
             let mut sum = [0i32; 3];
             for source_row in rows {
-                for pixel in source_row[at..at + 8].chunks_exact(4) {
+                for pixel in source_row[at..at + 8].as_chunks::<4>().0 {
                     for (total, &value) in sum.iter_mut().zip(pixel) {
                         *total += i32::from(value);
                     }
@@ -259,7 +259,11 @@ mod tests {
         }
         let mut half = Vec::new();
         assert_eq!(downscale_half(&board, 4, 4, &mut half), (2, 2));
-        assert!(half.chunks_exact(4).all(|p| p == [128, 128, 128, 255]));
+        assert!(half
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .all(|p| *p == [128, 128, 128, 255]));
 
         // A checkerboard of 2x2 squares keeps its squares, one pixel each
         let mut squares = Vec::new();
@@ -270,7 +274,7 @@ mod tests {
             }
         }
         downscale_half(&squares, 4, 4, &mut half);
-        let firsts: Vec<u8> = half.chunks_exact(4).map(|p| p[0]).collect();
+        let firsts: Vec<u8> = half.as_chunks::<4>().0.iter().map(|p| p[0]).collect();
         assert_eq!(firsts, vec![200, 10, 10, 200]);
     }
 
