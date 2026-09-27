@@ -26,13 +26,10 @@ not compress audio at all. What arrives is bit-identical to what left.
        AVSampleBufferDisplayLayer ◀─ reassembly ◀───────────────────────┤
                     CoreAudio ◀──── jitter buffer ◀─────────────────────┘
 
-The diagram is the Mac receiver's path. A Windows receiver decodes the same
-H.264 or HEVC stream through Media Foundation and renders it with Direct3D 11.
-Audio plays back through WASAPI in shared mode. A Windows sender mirrors the
-same diagram with different building blocks. DXGI Desktop Duplication takes
-ScreenCaptureKit's place for capture, and WASAPI loopback takes CoreAudio's
-for audio. The same Media Foundation used for receiving does the encoding
-too.
+The diagram shows a Mac at both ends. Windows builds the same shape from
+Desktop Duplication for the screen, WASAPI loopback for the audio, and Media
+Foundation for encoding and decoding, with Direct3D 11 drawing the picture and
+WASAPI shared mode playing the sound.
 
 - **Video** is captured at the display's native pixel size and encoded with the
   hardware HEVC encoder in low-latency mode, or H.264 with `--codec h264`.
@@ -126,15 +123,12 @@ On the machine sharing its screen:
 
     stereowire send --to <peer-tailscale-name-or-ip>
 
-On Windows that's `stereowire.exe send --to <peer>`, from the same .exe that
-receives.
-
 On the machine watching:
 
     stereowire receive
 
-Only one direction runs at a time. Swapping who shares just means swapping
-which command each machine runs, on either platform.
+Only one direction runs at a time. To trade places, swap which command each
+machine runs.
 
 When the sender is a Mac and the watcher is on Windows, add `--codec h264`:
 
@@ -142,9 +136,8 @@ When the sender is a Mac and the watcher is on Windows, add `--codec h264`:
 
 Windows decodes H.264 with no extra software. HEVC needs the "HEVC Video
 Extensions" app from the Microsoft Store, and the receiver says so if it's
-missing. A Windows sender defaults to h264 already, since Microsoft's own
-encoder does nothing else, and it needs a hardware HEVC encoder before it
-will even try HEVC: without one it says to pass `--codec h264` instead.
+missing. A Windows sender defaults to h264, since Microsoft's encoder handles
+nothing else, and offers HEVC only through a hardware encoder.
 
 On the Windows machine, sending or watching is the same command as above, run
 as `stereowire.exe send` or `stereowire.exe receive` (see Setup for the
@@ -160,8 +153,8 @@ output in the DAW and point `--audio-device` at its name. REAPER offers both
 settings.
 
 `STEREOWIRE_SOFTWARE_ENCODER=1` in the environment skips hardware video
-encoders in favour of Microsoft's software one, the way out when a graphics
-driver's encoder misbehaves.
+encoders and uses Microsoft's software one, for a graphics driver whose
+encoder misbehaves.
 
 Talk over a separate channel (a phone call, Discord on your phones) so the
 conversation never competes with the audio you are judging.
@@ -380,18 +373,15 @@ Measured on an M-series Mac:
 jitter over a long path does and is harsher here than a real route: these runs
 shuffle roughly a tenth of all packets.
 
-Windows can now encode too, so its self-test can run the whole live path the
-way the Mac's does: `stereowire.exe selftest --codec h264` records its own
-frames through the Windows encoder, sends them through the loopback sockets,
-and decodes them back. The summary line reports `first output after N input
-frames` on both platforms now, which is the encoder's own latency, measured
-before a single packet reaches the network.
+The Windows self-test runs the same live path: `stereowire.exe selftest
+--codec h264` encodes the pattern with the Windows encoder, sends it through
+the loopback sockets and decodes it back. On both platforms the summary line
+reports `first output after N input frames`, the encoder's own latency.
 
-`--dump` and `--replay` still matter beside that: `--dump` writes every
-encoded video datagram to a file, and `--replay` feeds a file back through
-the same delivery-and-verify path on either platform with no encoder
-involved, which is how the Windows *decoder* gets checked against a stream it
-did not produce itself:
+`--dump` writes every encoded video datagram to a file, and `--replay` feeds
+a file back through the same delivery-and-verify path on either platform with
+no encoder involved. That is how the Windows decoder is checked against a
+stream from another encoder:
 
     stereowire selftest --codec h264 --dump pattern-h264.swd        # on the Mac
     stereowire selftest --replay pattern-h264.swd                   # on either machine
@@ -413,13 +403,12 @@ tests run under Wine with
 x86_64-pc-windows-gnu`, and the whole receiver runs under CrossOver, which
 supplies Media Foundation backed by GStreamer, and Direct3D on Metal.
 
-The live self-test runs under Wine too, whose H.264 encoder ignores every
-setting it is given but still completes the whole path: 90 of 90 frames, 54.0
-dB mean PSNR, 55 frames of encoder latency, measured under Homebrew Wine.
-That confirms the code path works end to end. Microsoft's own software
-encoder, running the same self-test on GitHub's Windows runner in CI, gives
-the number to trust: 60 of 60 frames at 45.1 dB mean PSNR, first output after
-one input frame, with only `AVEncCommonRealTime` refused.
+The live self-test runs under Homebrew Wine too, whose H.264 encoder ignores
+every setting but completes the path: 90 of 90 frames, 54.0 dB mean PSNR, 55
+frames of encoder latency. The measurement that counts comes from Microsoft's
+software encoder on GitHub's Windows runner in CI: 60 of 60 frames at 45.1 dB
+mean PSNR, first output after one input frame, with only `AVEncCommonRealTime`
+refused.
 
 Every frame that is displayed is clean, and loss costs a brief resync. **Audio
 degrades far more gracefully than video**, which is the intended priority: it
@@ -440,9 +429,8 @@ The `app` job builds and tests the sender and receiver together on macOS,
 since building the sender needs Apple frameworks. Its self-test runs
 unattended: no display and no Screen Recording permission are needed, so the
 encoder, sockets, reassembly and decoder are all exercised on every push. It
-also dumps an H.264 pattern for the next job: replaying a stream it did not
-encode itself is how the Windows *decoder* gets checked, which still matters
-now that Windows has an encoder of its own to test separately.
+also dumps an H.264 pattern for the next job, which checks the Windows decoder
+against a stream from another encoder.
 
 A `windows` job then builds and tests the sender and receiver on
 `windows-latest`, replaying that dump through the Media Foundation decoder
@@ -574,8 +562,8 @@ with FEC on, or ~3.1 Mbit/s with `--no-fec`.
   at 1440p60.
 - Windows converts every captured frame to NV12 on the CPU with plain scalar
   code, and falls back to a software H.264 encoder when no hardware encoder
-  is found. Either one costs real CPU time, which is why CPU use at 1440p60
-  needs checking on real hardware.
+  is found. Both cost CPU time, so CPU use at 1440p60 needs checking on real
+  hardware.
 - Captures the main display only, the primary monitor at (0, 0) on Windows.
   Window and multi-display selection is not wired up on either platform.
 - A Windows desktop wider than `--max-width` (2560 by default) is halved
@@ -584,8 +572,7 @@ with FEC on, or ~3.1 Mbit/s with `--no-fec`.
 - An HDR desktop on Windows is refused outright, with a message pointing at
   the "Use HDR" display setting to turn off.
 - Desktop Duplication does not work inside some remote desktop sessions and
-  virtual machines, or under Wine. The sender says so with a clear message
-  rather than failing with a raw error code.
+  virtual machines, or under Wine. The sender says so plainly.
 - No encryption of its own: the tunnel provides it. See Security above.
 - Audio and video are timestamped on one capture clock and their offset is
   measured and reported, but nothing actively aligns them. Video is shown as
