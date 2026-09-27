@@ -1,7 +1,7 @@
 # stereowire
 
-A high-fidelity, low-latency screen and system-audio link from a Mac to a Mac
-or Windows PC.
+A high-fidelity, low-latency screen and system-audio link between Macs and
+Windows PCs.
 
 Built for watching someone work in a digital audio workstation over the
 internet: you see their screen at native resolution and hear exactly what they
@@ -28,7 +28,11 @@ not compress audio at all. What arrives is bit-identical to what left.
 
 The diagram is the Mac receiver's path. A Windows receiver decodes the same
 H.264 or HEVC stream through Media Foundation and renders it with Direct3D 11.
-Audio plays back through WASAPI in shared mode.
+Audio plays back through WASAPI in shared mode. A Windows sender mirrors the
+same diagram with different building blocks. DXGI Desktop Duplication takes
+ScreenCaptureKit's place for capture, and WASAPI loopback takes CoreAudio's
+for audio. The same Media Foundation used for receiving does the encoding
+too.
 
 - **Video** is captured at the display's native pixel size and encoded with the
   hardware HEVC encoder in low-latency mode, or H.264 with `--codec h264`.
@@ -96,20 +100,25 @@ missing dependency is explained at startup with the command that fixes it.
     stereowire doctor                   check Tailscale and permissions
     stereowire doctor --peer <peer>     also check that peer is reachable and direct
 
-### Watching from Windows
+### Windows
 
-Sending is Mac-only, but the watcher can be on Windows 10 or 11 x64:
+The same `stereowire.exe` sends or receives. Sending needs Windows 8 or
+later, and receiving needs Windows 10 or 11 x64. Either way there's nothing
+extra to install: Desktop Duplication, Media Foundation and WASAPI already
+ship with Windows.
 
 1. Install [Tailscale for Windows](https://tailscale.com/download/windows) and
-   sign in to the same account as the sender.
+   sign in to the same account as the other machine.
 2. Get `stereowire.exe`: download the `stereowire-windows-x64` artifact from
    the latest CI run (see Continuous integration), or build it yourself (see
    Distribution).
-3. Run it: `stereowire.exe receive` from a terminal, or double-click it, which
-   receives with no arguments needed. The first run triggers a Windows
-   Firewall prompt, since the receiver listens on UDP 9000: allow it on
-   private networks. The .exe is unsigned, so SmartScreen shows "Windows
-   protected your PC": click `More info`, then `Run anyway`.
+3. Run it: `stereowire.exe send --to <peer>` to share this PC's screen, or
+   `stereowire.exe receive` from a terminal, or double-click it, which
+   receives with no arguments needed. Receiving triggers a Windows Firewall
+   prompt on first run, since it listens on UDP 9000: allow it on private
+   networks. The .exe is unsigned, so SmartScreen shows "Windows protected
+   your PC" the first time you run it, whichever command: click `More info`,
+   then `Run anyway`.
 
 ## Usage
 
@@ -117,23 +126,42 @@ On the machine sharing its screen:
 
     stereowire send --to <peer-tailscale-name-or-ip>
 
+On Windows that's `stereowire.exe send --to <peer>`, from the same .exe that
+receives.
+
 On the machine watching:
 
     stereowire receive
 
-Only one direction runs at a time. Swapping who runs which command needs two
-Macs, since a Windows machine can only run `receive`.
+Only one direction runs at a time. Swapping who shares just means swapping
+which command each machine runs, on either platform.
 
-When the watcher is on Windows, add `--codec h264` on the sender:
+When the sender is a Mac and the watcher is on Windows, add `--codec h264`:
 
     stereowire send --to <peer> --codec h264
 
 Windows decodes H.264 with no extra software. HEVC needs the "HEVC Video
 Extensions" app from the Microsoft Store, and the receiver says so if it's
-missing.
+missing. A Windows sender defaults to h264 already, since Microsoft's own
+encoder does nothing else, and it needs a hardware HEVC encoder before it
+will even try HEVC: without one it says to pass `--codec h264` instead.
 
-On the Windows machine, watching is the same command, run as
-`stereowire.exe receive` (see Setup for the firewall prompt and SmartScreen).
+On the Windows machine, sending or watching is the same command as above, run
+as `stereowire.exe send` or `stereowire.exe receive` (see Setup for the
+firewall prompt and SmartScreen).
+
+**If the sharer runs a DAW** and loopback capture stays silent while it
+plays, the DAW's audio system is set to ASIO or WASAPI exclusive mode, which
+bypasses the Windows mixer that loopback taps. Either switch the DAW's audio
+system to WASAPI shared mode for the session (some added latency inside the
+DAW, fine for mixing and arranging, a problem only if you're tracking with
+software monitoring), or add a virtual cable such as VB-CABLE as an extra
+output in the DAW and point `--audio-device` at its name. REAPER offers both
+settings.
+
+`STEREOWIRE_SOFTWARE_ENCODER=1` in the environment skips hardware video
+encoders in favour of Microsoft's software one, the way out when a graphics
+driver's encoder misbehaves.
 
 Talk over a separate channel (a phone call, Discord on your phones) so the
 conversation never competes with the audio you are judging.
@@ -143,10 +171,11 @@ Useful flags:
     stereowire send --mbps 40           video bitrate (default 40)
     stereowire send --max-width 2560    cap capture width (default 2560)
     stereowire send --fps 60            frame rate (default 60)
-    stereowire send --codec h264        default hevc, use h264 for a Windows watcher
+    stereowire send --codec h264        default hevc on a Mac, h264 on Windows
     stereowire send --no-fec            halve audio bandwidth, lose loss recovery
     stereowire send --min-mbps 8        floor congestion control may not go below
     stereowire send --no-congestion-control   hold the bitrate fixed
+    stereowire send --audio-device NAME  Windows: capture this device instead of the default loopback
     stereowire receive --max-mbps 40    highest bitrate to ask the sender for
     stereowire receive --buffer-ms 50   more audio buffering on a jittery link
     stereowire receive --no-audio       watch silently
@@ -177,6 +206,19 @@ recording per channel:
 - **The app's own playback is excluded**, so running both ends on one Mac
   cannot form a feedback loop.
 
+**On Windows, WASAPI loopback taps the same kind of system mix**, through the
+default output device. A silent stream plays into that device to keep
+loopback delivering when nothing else is making sound, and a DAW on ASIO or
+WASAPI exclusive mode bypasses the mix entirely, which is what
+`--audio-device` and the virtual-cable route under Usage are for.
+
+The picture side captures the primary monitor only, the display at (0, 0).
+The cursor is drawn in from the pointer shape Desktop Duplication reports,
+and `--hide-cursor` removes it. A desktop wider than `--max-width` (2560 by
+default) is halved exactly, so a 4K display goes out at 1920x1080, since 2:1
+is the only scale factor there is so far. An HDR desktop is refused outright,
+with a message pointing at the "Use HDR" display setting to turn off.
+
 ### Sample rate
 
 The wire format carries whatever rate the capture is actually running at, and
@@ -189,12 +231,16 @@ which is measurable but easy to miss by ear if you are not listening for it.
 `--sample-rate` asks for a rate, defaulting to the output device's own. If the
 system overrides it, `stereowire send` says so:
 
-    audio: capturing at 48000 Hz (asked for 44100; macOS chose the rate)
+    audio: capturing at 48000 Hz (asked for 44100; the system chose the rate)
+
+A Windows sender's rate is decided the same way: WASAPI shared mode always
+captures at the device's own mix rate, so `--sample-rate` is advisory there
+too.
 
 In practice this means a 44.1 kHz project is resampled to 48 kHz once, by
-CoreAudio, on the way into the capture. That conversion is not avoidable from
-here, and it is a single high-quality resampling pass, so it costs nothing you
-can hear. Everything downstream of it is bit-exact.
+CoreAudio on a Mac, on the way into the capture. That conversion is not
+avoidable from here, and it is a single high-quality resampling pass, so it
+costs nothing you can hear. Everything downstream of it is bit-exact.
 
 On the receiving Mac, opening output at the sender's rate switches the
 physical output device to that rate, and macOS does not switch it back when
@@ -334,10 +380,18 @@ Measured on an M-series Mac:
 jitter over a long path does and is harsher here than a real route: these runs
 shuffle roughly a tenth of all packets.
 
-Windows has no encoder, so its self-test replays a dump instead of recording
-one. `--dump` writes every encoded video datagram to a file, and `--replay`
-feeds a file back through the same delivery-and-verify path on either
-platform, with no encoder involved:
+Windows can now encode too, so its self-test can run the whole live path the
+way the Mac's does: `stereowire.exe selftest --codec h264` records its own
+frames through the Windows encoder, sends them through the loopback sockets,
+and decodes them back. The summary line reports `first output after N input
+frames` on both platforms now, which is the encoder's own latency, measured
+before a single packet reaches the network.
+
+`--dump` and `--replay` still matter beside that: `--dump` writes every
+encoded video datagram to a file, and `--replay` feeds a file back through
+the same delivery-and-verify path on either platform with no encoder
+involved, which is how the Windows *decoder* gets checked against a stream it
+did not produce itself:
 
     stereowire selftest --codec h264 --dump pattern-h264.swd        # on the Mac
     stereowire selftest --replay pattern-h264.swd                   # on either machine
@@ -359,6 +413,14 @@ tests run under Wine with
 x86_64-pc-windows-gnu`, and the whole receiver runs under CrossOver, which
 supplies Media Foundation backed by GStreamer, and Direct3D on Metal.
 
+The live self-test runs under Wine too, whose H.264 encoder ignores every
+setting it is given but still completes the whole path: 90 of 90 frames, 54.0
+dB mean PSNR, 55 frames of encoder latency, measured under Homebrew Wine.
+That confirms the code path works end to end. Microsoft's own software
+encoder, running the same self-test on GitHub's Windows runner in CI, gives
+the number to trust: 60 of 60 frames at 45.1 dB mean PSNR, first output after
+one input frame, with only `AVEncCommonRealTime` refused.
+
 Every frame that is displayed is clean, and loss costs a brief resync. **Audio
 degrades far more gracefully than video**, which is the intended priority: it
 stays bit-exact through 2% loss combined with heavy reordering.
@@ -378,12 +440,15 @@ The `app` job builds and tests the sender and receiver together on macOS,
 since building the sender needs Apple frameworks. Its self-test runs
 unattended: no display and no Screen Recording permission are needed, so the
 encoder, sockets, reassembly and decoder are all exercised on every push. It
-also dumps an H.264 pattern for the next job, since Windows has no encoder to
-make its own.
+also dumps an H.264 pattern for the next job: replaying a stream it did not
+encode itself is how the Windows *decoder* gets checked, which still matters
+now that Windows has an encoder of its own to test separately.
 
-A `windows` job then builds and tests the receiver on `windows-latest`,
-replaying that dump through the Media Foundation decoder clean and with loss
-and reordering, and uploads the resulting `stereowire.exe` as the
+A `windows` job then builds and tests the sender and receiver on
+`windows-latest`, replaying that dump through the Media Foundation decoder
+clean and with loss and reordering. It also runs the self-test's live path
+with Microsoft's own software H.264 encoder end to end, something no Wine on
+a Mac can exercise, and uploads the resulting `stereowire.exe` as the
 `stereowire-windows-x64` artifact, so a build can be handed to a Windows
 tester without a Windows machine.
 
@@ -488,20 +553,39 @@ with FEC on, or ~3.1 Mbit/s with `--no-fec`.
 
 ## Limits
 
-- Sender: macOS 13+ only. Receiver: macOS 13+ or Windows 10/11 x64. The
-  capture and codec layers are Apple-specific. The protocol crate
-  (`stereowire-proto`) is portable Rust with no platform dependencies.
-- No Windows sender. Screen and system-audio capture are ScreenCaptureKit and
-  CoreAudio, both macOS-only, so `stereowire send` on a Windows build errors
-  immediately: `sending is macOS only for now; this build can receive`.
+- Sender: macOS 13+ or Windows 8+. Receiver: macOS 13+ or Windows 10/11 x64.
+  The capture and codec layers are platform-specific, one implementation for
+  macOS and one for Windows. The protocol crate (`stereowire-proto`) is
+  portable Rust with no platform dependencies.
 - Windows decoding is software only, through Media Foundation's own H.264 and
   HEVC decoders. No hardware path is used yet. 1440p60 needs a capable CPU,
   and `--max-width 1920` on the sender is the lever if the picture stutters.
-- HEVC on Windows needs the "HEVC Video Extensions" app from the Microsoft
-  Store. Without it, the receiver asks for `--codec h264` instead.
+- HEVC on Windows needs help in both directions: the receiver needs the
+  "HEVC Video Extensions" app from the Microsoft Store, and the sender needs
+  a hardware HEVC encoder, else it says to use `--codec h264` instead.
 - Decoder latency on Windows has not been measured on real hardware.
   Microsoft's decoder accepts low-latency mode there, and a real session will
   show what that buys.
+- The Windows sender has not run on a real PC yet, so none of this is
+  verified: Desktop Duplication's start-up and recovery, the cursor (its
+  position, especially the I-beam and resize shapes, and what display scaling
+  does to it), a hardware encoder and its latency, loopback with and without
+  audio actually playing, `--audio-device` with a virtual cable, and CPU use
+  at 1440p60.
+- Windows converts every captured frame to NV12 on the CPU with plain scalar
+  code, and falls back to a software H.264 encoder when no hardware encoder
+  is found. Either one costs real CPU time, which is why CPU use at 1440p60
+  needs checking on real hardware.
+- Captures the main display only, the primary monitor at (0, 0) on Windows.
+  Window and multi-display selection is not wired up on either platform.
+- A Windows desktop wider than `--max-width` (2560 by default) is halved
+  exactly, so a 4K display goes out at 1920x1080: 2:1 is the only scale
+  factor there is so far.
+- An HDR desktop on Windows is refused outright, with a message pointing at
+  the "Use HDR" display setting to turn off.
+- Desktop Duplication does not work inside some remote desktop sessions and
+  virtual machines, or under Wine. The sender says so with a clear message
+  rather than failing with a raw error code.
 - No encryption of its own: the tunnel provides it. See Security above.
 - Audio and video are timestamped on one capture clock and their offset is
   measured and reported, but nothing actively aligns them. Video is shown as
@@ -511,7 +595,6 @@ with FEC on, or ~3.1 Mbit/s with `--no-fec`.
   machines: on one, playback feeds back into capture, and disabling playback
   drains the buffer as fast as it fills.
 - One direction at a time, by design.
-- Captures the main display. Window and multi-display selection is not wired up.
 - Video recovers at most two lost fragments per group of ten, so a link losing
   more than a few percent will visibly stutter while audio keeps working.
 - The link has never been run between two machines on the real internet. Every

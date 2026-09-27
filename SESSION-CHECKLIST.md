@@ -39,6 +39,19 @@ If the watcher is on Windows:
 - Check the console afterwards for the interface rate note: if the output
   device is not at the stream's rate, Windows resamples and says so.
 
+If the sharer is on Windows:
+
+- Check the DAW's audio system before anything else: ASIO or WASAPI exclusive
+  mode bypasses the Windows mixer, so loopback hears nothing from it. REAPER
+  fixes this by switching to WASAPI shared mode for the session, or by adding
+  a virtual cable as an extra output.
+- A virtual cable needs `--audio-device <name>` on the sender, to capture it
+  instead of the default loopback.
+- Check the startup lines: `encoder: <name> H.264 via Media Foundation
+  (sync|async), settings refused: none|<list>` names the encoder Windows
+  picked, and `audio: capturing <device> (loopback of the output|input) at
+  <rate> Hz, <N> channels` names the audio device it opened.
+
 ## What to read, and what it means
 
 **Sender**, every five seconds:
@@ -74,6 +87,10 @@ If the watcher is on Windows:
 | clock drift ppm | receiver | confirms drift compensation is doing something on real clocks |
 | a/v offset | receiver | never yet measured between two machines |
 | frame pacing on Windows | receiver console, `video frames (N shown)` | whether software decoding keeps up with the sender's fps, the untested part of that path |
+| encoder name and refused settings | sharer console, the `encoder:` line | which encoder Windows picked, and what it refused |
+| first-output latency | local `selftest --codec h264` on the sharer's PC first | the encoder's own latency, apart from anything the network adds |
+| cursor placement | the picture, on the watcher's end | whether pointer position and shape survive display scaling, unverified on real hardware |
+| loopback during silence | sharer console, the `audio:` peak reading while quiet | whether loopback keeps delivering with nothing playing, unverified on real hardware |
 
 ## If it goes wrong
 

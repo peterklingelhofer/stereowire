@@ -47,9 +47,10 @@ jobs:
       # display and no Screen Recording permission, so it runs unattended.
       - name: Media path self-test
         run: ./target/release/stereowire selftest --frames 60 --width 640 --height 360
-      # Windows has no encoder, so its self-test replays datagrams recorded
-      # here instead. H.264 is the codec it decodes without extra software,
-      # which is what the windows job below needs to check
+      # Windows can encode now too, but the decoder still needs a stream it
+      # did not produce itself to check against: this is that stream. H.264
+      # is the codec it decodes without extra software, which is what the
+      # windows job below replays
       - name: Dump an H.264 pattern for the Windows self-test to replay
         run: ./target/release/stereowire selftest --codec h264 --frames 60 --width 640 --height 360 --dump pattern-h264.swd
       - uses: actions/upload-artifact@v4
