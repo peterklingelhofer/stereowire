@@ -31,6 +31,7 @@ use clap::{Parser, Subcommand, ValueEnum};
 #[derive(Parser)]
 #[command(
     name = "stereowire",
+    version,
     about = "High-fidelity screen and system-audio link between Macs and Windows PCs"
 )]
 struct Cli {
